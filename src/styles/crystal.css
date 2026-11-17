@@ -1,0 +1,2094 @@
+/* ==========================================================================
+   TTV Short Drama · 播放器晶体材质系统（方案 D「温润亚克力 2.0」）
+   --------------------------------------------------------------------------
+   设计语言：15% 高透浅白磨砂玻璃 + 22px 高斯模糊 + 1:1 贴合暗衬。
+
+   关于暗衬：白色文字直接压在明亮视频画面上会糊成一片（"泛光"）。这里把
+   暗衬放进 background-color、白玻璃放进 background-image，天然形成
+   「模糊画面 → 暗衬 → 玻璃 → 文字」的正确层序，不需要伪元素 + z-index:-1，
+   既少一个合成层，也不依赖父级是否创建堆叠上下文。
+
+   命名：crystal-* 与设计稿一一对应（设计稿属维护者本地材料）；
+   纯播放器结构件用 ttv-* 前缀，避免影响其余视图。
+   ========================================================================== */
+
+:root {
+  /* 晶体材质参数 */
+  --crystal-opacity: 0.15;
+  --crystal-blur: 22px;
+  --crystal-scrim: rgba(0, 0, 0, 0.40);
+  --crystal-scrim-deep: rgba(15, 23, 42, 0.55);
+  --crystal-border: rgba(255, 255, 255, 0.18);
+
+  /* Windows 11 原生 Fluent 配色 */
+  --fluent-blue: #0078d4;
+  --fluent-blue-hover: #005bb5;
+  --fluent-sky: #38bdf8;
+
+  /*
+   * 进度条语义色跟随主题（浅色 = 品牌蓝，暗色 = 黑红），但**三条进度条共用同
+   * 一组变量**：完整条、收起态贴边细条、小窗进度条。旧实现里前两者用变量、
+   * 小窗写死 `bg-blue-500`，于是同一时刻"主窗口红、小窗蓝"。
+   *
+   * 底轨为什么是中性灰而不是白色：这条细条叠在视频画面上，纯白半透明
+   * （旧值 rgba(255,255,255,0.22)）在白墙 / 白西装 / 雪景上叠合后亮度差为 0，
+   * 3.5px 的线等于完全不存在 —— 这正是「收起后进度条有时候不见了」的成因。
+   * 中性灰叠白约 185、叠黑约 70，与两种极端背景都拉开约 70 的亮度差。
+   */
+  --progress-played-from: #4da3ff;
+  --progress-played-to: #0078d4;
+  --progress-buffer: rgba(213, 213, 213, 0.6);
+  --progress-track: rgba(128, 128, 128, 0.55);
+  --progress-glow: rgba(0, 120, 212, 0.58);
+
+  /* 平缓动效曲线 */
+  --curve-fluent: cubic-bezier(0.16, 1, 0.3, 1);
+  --curve-spring: cubic-bezier(0.22, 1.35, 0.36, 1);
+
+  /* 滚动数字单字形高度（JS 侧按同一数值换算位移） */
+  --roller-h: 18px;
+}
+
+/* ==========================================================================
+   1. 晶体材质
+   ========================================================================== */
+
+.crystal-surface {
+  position: relative;
+  background-color: var(--crystal-scrim);
+  background-image: linear-gradient(
+    rgba(255, 255, 255, var(--crystal-opacity)),
+    rgba(255, 255, 255, var(--crystal-opacity))
+  );
+  backdrop-filter: blur(var(--crystal-blur)) saturate(180%);
+  -webkit-backdrop-filter: blur(var(--crystal-blur)) saturate(180%);
+  border: 1px solid var(--crystal-border);
+  box-shadow: 0 8px 30px -4px rgba(0, 0, 0, 0.18);
+}
+
+/* 大面板（选集巨幕）用的更厚実材质：更深的景深暗衬 + 更大的模糊半径 */
+.crystal-surface-deep {
+  background-color: var(--crystal-scrim-deep);
+  background-image: linear-gradient(
+    rgba(255, 255, 255, var(--crystal-opacity)),
+    rgba(255, 255, 255, var(--crystal-opacity))
+  );
+  backdrop-filter: blur(32px) saturate(190%);
+  -webkit-backdrop-filter: blur(32px) saturate(190%);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  box-shadow:
+    0 25px 60px -10px rgba(0, 0, 0, 0.55),
+    inset 0 1px 1px 0 rgba(255, 255, 255, 0.35);
+}
+
+/* ==========================================================================
+   2. 播放器根容器与状态
+   ========================================================================== */
+
+.ttv-player {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  overflow: hidden;
+}
+
+/*
+ * RTX VSR 开启时禁用主播放器舞台内的背景模糊（backdrop-filter），为视频呈现让路。
+ * VSR 关闭时不挂 `.ttv-vsr-on`，组件恢复完整的毛玻璃材质。
+ *
+ * 为什么必须这么做：`backdrop-filter` 要求合成器把**该元素背后的像素**取样出来
+ * 做高斯模糊，一旦视频被这个区域盖住，Chromium 就必须把视频内容复制成普通纹理
+ * 参与合成——视频不再是独立的呈现平面。而 NVIDIA 的 RTX 视频增强（VSR）正是
+ * 挂在视频呈现链路上，视频一旦被合成器接管，整条链路就失效（表现为"RTX 视频增强
+ * 在这个播放器里不起作用"，但同一个驱动设置在其他播放器里照常生效）。
+ *
+ * 实测对照：动漫播放器最初自绘的控制条是纯半透明底（无 backdrop-filter），VSR
+ * 正常；改用时下的 crystal 材质 HUD（标题岛与控制坞都是 .crystal-surface，
+ * 带 blur(32px)）之后，同样的机器、同样的驱动设置，VSR 不再生效。去掉这批背景
+ * 模糊后 VSR 恢复——这条规则就是那次修复。
+ *
+ * 历史上只给短剧加 `.ttv-player`、去掉 HUD 模糊仍未生效，因此曾撤回；当时
+ * 怀疑竖屏视频缩小显示，但没有确证。2026-10-06 在真实 WebView2 中用同一段
+ * HEVC 视频做四组对照：原布局、只去模糊、只去动画均无 NVIDIA 超分调用；同时
+ * 去模糊并移除 App.tsx 播放器祖先的 fluentScaleIn/forwards 后，2 秒采样出现
+ * 34 次 ToggleNvidiaVpSuperResolution(on=true)。干净布局下 H.264/HEVC 均可触发。
+ * 两处约束必须一起保留，不能再把“只改一处无效”误判为短剧本身不支持 VSR。
+ *
+ * 视觉代价可控：面板本身的半透明底色、边框与阴影都保留，只是不再模糊画面。
+ * 播放场景下"看清视频"优先于"玻璃质感"，而列表/详情等页面不受这条规则影响。
+ *
+ * 用独立的 `.ttv-video-stage` 承载合成约束，不把 `.ttv-player` 的历史布局/
+ * 锁定态规则顺带引入短剧。两个播放器都按 VSR 状态启停舞台模糊。
+ */
+.ttv-video-stage.ttv-vsr-on .crystal-surface,
+.ttv-video-stage.ttv-vsr-on .crystal-surface-deep,
+.ttv-video-stage.ttv-vsr-on .ttv-drawer-overlay,
+.ttv-video-stage.ttv-vsr-on .crystal-drawer-box,
+.ttv-video-stage.ttv-vsr-on [class*='backdrop-blur'] {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/*
+ * ===== VSR 关闭时的「合成打断器」（2026-10-25）=====
+ *
+ * ## 为什么"关掉转码"关不掉超分
+ *
+ * 应用侧的开关只决定**是否为超分而转码**：开 = 转 H.264 分片，关 = 源编码直连
+ * （红果实测 `h265_hvc1`，已用 ffmpeg 核对）。但当前驱动 + WebView2（已开
+ * `PlatformHEVCDecoderSupport`）对 **HEVC 一样会做 RTX VSR**，于是关掉之后
+ * 画面依然被超分、驱动角标依然亮 —— 用户看到的就是"开关没反应"。
+ *
+ * ## 唯一有效的应用侧手段：让它离开独立呈现平面
+ *
+ * 上面那条「禁止祖先 transform / backdrop-filter」的规则本来是为了让 VSR
+ * **生效**（不变量 26，实测 HUD 带 blur 时 VSR 失效、去掉就恢复）。这里反向
+ * 使用它：只要视频被合成器接管，驱动就拿不到干净的视频呈现平面，超分自然停。
+ *
+ * ## ⚠️ 为什么**不能**用 filter（2026-10-25 实机事故）
+ *
+ * 第一版写的是 `filter: brightness(1.0001)`，结果"播到某处画面卡住、媒体时钟
+ * 停走"：日志里 `timeupdate 心跳`（每 5 秒一条）从此消失，且没有 `waiting` /
+ * `error` / `ended` 任何事件 —— 媒体管线整个冻住了。原因是 Chromium 对
+ * `<video>` 应用 filter 会强制把每一帧渲进离屏纹理再合成（pixel readback），
+ * 在 WebView2 + 这版驱动上会直接打断视频呈现链路。
+ *
+ * 换成 `opacity: 0.999`：它同样让元素成为合成层，但走的是标准 alpha 合成，
+ * 不做 readback，媒体时钟不受影响；0.999 在视觉上不可分辨。
+ *
+ * **只在 VSR 关闭时挂**（`vsrEnabled ? '' : ' ttv-vsr-off'`）。开启时这条路径
+ * 完全不存在，不会给播放器多一个合成层。
+ */
+.ttv-vsr-off {
+  transform: translateZ(0);
+  opacity: 0.999;
+}
+
+/* HUD 层：顶部标题岛 + 底部操控坞 */
+.ttv-hud {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 26px;
+  pointer-events: none;
+  /*
+    ⚠️ **只过渡 opacity，不碰 transform**（2026-10-22 修「播放器动画卡顿」）。
+
+    ## 为什么去掉 transform
+
+    这里原本是 `transition: opacity .3s, transform .3s` + 隐藏态
+    `transform: scale(.985)`。那个 0.985 的缩放只有 1.5%，肉眼几乎看不出，
+    代价却是：**只要 HUD 上有 transform，它就是一个独立的合成层**，而 HUD 覆盖
+    整个视频舞台（`inset: 0`）。控制条每次显示/隐藏都要重建这块合成区域，
+    与视频的呈现平面争合成器时间 —— 用户看到的就是"鼠标一动控制条弹出来时
+    画面顿一下"。
+
+    项目不变量 26 记的正是这件事：`crystal.css:110` 的实测结论是「去模糊**并**
+    移除祖先 transform」之后 `ToggleNvidiaVpSuperResolution(on=true)` 才恢复
+    （2 秒采样 34 次）。HUD 不是 video 的祖先而是兄弟，所以它不会让 VSR 失效，
+    但它照样是一次覆盖全屏的合成 —— 卡顿和 VSR 是同一个根因的两个表现。
+
+    ## 为什么去掉了也不影响观感
+
+    隐藏时保留 opacity 淡出，控制条自己仍有 `translateY` 的入场位移（见下方
+    `.ttv-top-bar` / `.ttv-dock` 的规则）。"整层微微缩小"这个细节本来就在
+    1.5% 的量级，去掉之后只剩淡出，反而更干净 —— 播放器里任何多余的动效都在
+    和视频抢注意力。
+  */
+  transition: opacity 0.3s ease;
+}
+
+.ttv-hud.is-feed {
+  justify-content: flex-end;
+}
+
+/*
+  自动隐藏态（播放中静默 2.5s 后）：整层淡出。
+  该类由 PlayerControls 按 isVisible 直接挂在 HUD 元素上——
+  此前 CSS 里没有这条规则，淡出从未生效。
+*/
+.ttv-hud.is-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* 控制器收起（锁定）态：整层淡出，画面完全让给视频 */
+.ttv-hud.is-locked,
+.ttv-player.is-locked .ttv-hud {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.ttv-player.is-locked .ttv-top-bar,
+.ttv-hud.is-hidden .ttv-top-bar {
+  transform: translateY(-16px);
+}
+
+.ttv-player.is-locked .ttv-dock,
+.ttv-hud.is-hidden .ttv-dock {
+  transform: translateY(20px);
+}
+
+/* ==========================================================================
+   3. 右侧居中小锁（展开 / 收起控制器）
+   ========================================================================== */
+
+.ttv-lock {
+  position: absolute;
+  right: 22px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 45;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 0.25s var(--curve-fluent),
+    transform 0.25s var(--curve-fluent),
+    right 0.35s var(--curve-fluent),
+    background-color 0.2s,
+    border-color 0.2s,
+    box-shadow 0.2s,
+    color 0.2s;
+}
+
+/* 仅在控制器可见或已收起时露出（播放中静默时与小锁一并隐去，保持沉浸） */
+.ttv-lock.is-shown {
+  opacity: 0.92;
+  pointer-events: auto;
+}
+
+.ttv-lock:hover {
+  opacity: 1;
+  transform: translateY(-50%) scale(1.1);
+  background-color: rgba(255, 255, 255, 0.26);
+  background-image: none;
+  color: var(--fluent-sky);
+  box-shadow: 0 8px 24px rgba(0, 120, 212, 0.35);
+}
+
+.ttv-lock:active {
+  transform: translateY(-50%) scale(0.95);
+}
+
+.ttv-lock svg {
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6));
+}
+
+/* 收起态高亮 */
+.ttv-lock.is-locked {
+  background-color: var(--fluent-blue);
+  background-image: none;
+  border-color: rgba(255, 255, 255, 0.35);
+  color: #fff;
+  box-shadow: 0 0 20px rgba(0, 120, 212, 0.65);
+  opacity: 0.95;
+}
+
+.ttv-lock.is-locked:hover {
+  background-color: var(--fluent-blue-hover);
+  transform: translateY(-50%) scale(1.12);
+}
+
+/*
+  收起后小锁自动贴边半隐藏：只露出小半个弧面与图标，鼠标靠近即平滑弹出。
+  ::before 把悬停热区向左、上下各扩一圈，避免要精确瞄准那半个圆点。
+  hover/focus 弹出不向左移出：窗口右缘贴边时若把按钮整体左移，
+  光标会落到按钮外导致 hover 失效弹回、再触发 hover——无限抖动。
+  原位完整展开（右缘仍贴窗口边）光标始终留在按钮内，状态稳定。
+*/
+.is-locked .ttv-lock.is-shown,
+.ttv-player.is-locked .ttv-lock.is-shown {
+  right: 0;
+  transform: translate(26%, -50%);
+  opacity: 0.88;
+  box-shadow: -3px 0 16px rgba(0, 120, 212, 0.45);
+}
+
+.is-locked .ttv-lock.is-shown::before,
+.ttv-player.is-locked .ttv-lock.is-shown::before {
+  content: '';
+  position: absolute;
+  top: -14px;
+  bottom: -14px;
+  left: -32px;
+  right: 0;
+}
+
+.is-locked .ttv-lock.is-shown:hover,
+html.kbd-nav .is-locked .ttv-lock.is-shown:focus-visible,
+.ttv-player.is-locked .ttv-lock.is-shown:hover,
+html.kbd-nav .ttv-player.is-locked .ttv-lock.is-shown:focus-visible {
+  transform: translate(0, -50%) scale(1.08);
+  opacity: 1;
+  box-shadow: 0 0 24px rgba(0, 120, 212, 0.7);
+}
+
+/* ==========================================================================
+   3.6 操作提示（空格 / 方向键 / 全屏 / 切集）
+   ========================================================================== */
+
+/*
+  形态对齐 B 站播放器：操作发生的那一刻，画面**正中央**闪一个
+  「圆形半透明底 + 图标 + 主文案 + 副文案」，停留约 0.76 秒后自己淡出。
+
+  为什么放正中央而不是角落：角落已经有音量、倍速、缓冲这些常驻信息了，
+  再往里塞会让边缘变成一块信息垃圾场；而中央本来就空着，且用户的视线
+  天然落在画面中间——提示放在那里，"我刚才那下生效了没有"一眼就能确认。
+
+  ## 为什么是圆形而不是方块（2026-10-19 重设计）
+
+  旧版是「黑色圆角方块 + 竖排图标文字」。实测的问题是**黑块太重**：
+  72% 不透明度的方块压在画面中央，看剧时像贴了一块膏药；
+  而且竖排让视线要上下扫，一瞥之间读不完。
+
+  圆底在同样面积下视觉重量更小（圆角让边缘退到背景里），
+  横排则符合"从左往右读"的习惯。副文案只在有数值时出现
+  （音量%、落点时间、集号），不堆信息。
+
+  ## 四个必须遵守的约束
+
+  1. **只做 opacity + scale，不做位移**。
+     播放器里任何常驻的 transform/filter 都会把 video 祖先钉成合成层，
+     让 RTX VSR 失效（不变量 26）。这层虽然只存在 0.76 秒、也不是 video 祖先，
+     但既然淡入就够表达"出现"，就不引入第二个变量。
+  2. **不用 backdrop-filter**。本舞台内所有背景模糊都会把视频拉进合成器，
+     同样会打掉 VSR（见本文件第 2 节的长注释）。圆底用纯色半透明。
+  3. **pointer-events: none**。它盖在画面中央，绝不能挡住"点画面暂停"。
+  4. **文字带描边阴影**。亮画面（雪景、白墙）上白字会糊，
+     `text-shadow` 是唯一不引入额外 DOM 就能保证可读的办法。
+
+  尺寸：圆底 68px、图标 30px、主文案 13px、副文案 11px。
+*/
+.ttv-player-toast {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  color: #fff;
+  pointer-events: none;
+
+  /* 默认隐藏：靠 .is-visible 点亮 */
+  opacity: 0;
+  transform: scale(0.92);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+/*
+  点亮：快速到位 + 轻微过冲。
+
+  `cubic-bezier(.22, 1.4, .42, 1)` 里的 1.4 是**过冲**——图标会稍微"弹"过
+  目标尺寸再回落，比线性缩放有生命感。这是这一版动效的核心手感。
+
+  起点 scale 取 .92 而不是 1：起点更小，弹回来的位移才看得出来。
+  0.92 也是刻意的——再小会像"从远处飞来"，而这一层是反馈不是表演。
+
+  `will-change` 只写在点亮态、不写在基础类上：
+  它是**常驻**提示吗？不是——这一层只在操作发生后的 0.76 秒里存在。
+  若把 `will-change` 挂在基础类上，元素虽然 opacity: 0 却仍然常驻 DOM
+  （组件在 payload 非空后就一直渲染），会白白占着一个合成层。
+  只在真正要动画时才提升，动画结束随 `is-visible` 一起撤掉。
+*/
+.ttv-player-toast.is-visible {
+  opacity: 1;
+  transform: scale(1);
+  will-change: opacity, transform;
+  transition:
+    opacity 0.1s ease-out,
+    transform 0.22s cubic-bezier(0.22, 1.4, 0.42, 1);
+}
+
+/* 圆底：深色半透明，不模糊（保护 VSR） */
+.ttv-player-toast-disc {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 68px;
+  height: 68px;
+  border-radius: 50%;
+  background: rgba(8, 10, 14, 0.56);
+  box-shadow:
+    0 6px 22px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  flex-shrink: 0;
+}
+
+/* 操作反馈也沿用控制台玻璃；VSR 开启时舞台规则会自动关闭背景模糊。 */
+.ttv-video-stage:not(.ttv-vsr-on) .ttv-player-toast-disc {
+  backdrop-filter: blur(var(--crystal-blur)) saturate(180%);
+  -webkit-backdrop-filter: blur(var(--crystal-blur)) saturate(180%);
+  border: 1px solid var(--crystal-border);
+}
+
+/*
+  音量进度弧：圆底外圈一道弧，直观表达"现在多大音量"。
+
+  用 `conic-gradient` + `mask` 画环，而不是叠一个 SVG 或额外 DOM：
+   - 纯 CSS，零额外节点；
+   - 改一个 CSS 变量就能更新，不需要重渲染 React 树；
+   - 不涉及 filter/backdrop-filter，不影响 VSR。
+
+  `--ttv-toast-volume` 由组件按当前音量写入（0%–100%）。
+  没传 volume 时整圈不渲染（`.has-volume` 才显示）。
+*/
+.ttv-player-toast-ring {
+  position: absolute;
+  inset: -5px;
+  border-radius: 50%;
+  background: conic-gradient(
+    rgba(255, 255, 255, 0.55) var(--ttv-toast-volume, 0%),
+    rgba(255, 255, 255, 0.1) 0
+  );
+  -webkit-mask: radial-gradient(circle, transparent 60%, #000 61%);
+  mask: radial-gradient(circle, transparent 60%, #000 61%);
+}
+
+.ttv-player-toast-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  /* 图标投影：亮画面上白图标不糊 */
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.5));
+  /*
+    图标脉冲：换图标时做一次「缩小 → 略放大 → 归位」，像按下去又弹回。
+
+    这是最关键的细节——旧版换图标是硬切，看起来机械。组件每次点亮会给
+    这个节点换一个 key 触发重挂，从而重播这段动画（只重挂图标，不是整个提示，
+    所以 `visible` 状态不受影响）。
+  */
+  animation: ttv-player-toast-pulse 0.22s ease-out;
+}
+
+@keyframes ttv-player-toast-pulse {
+  0% {
+    transform: scale(0.82);
+  }
+  55% {
+    transform: scale(1.06);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+/* 主文案：贴在圆底下方 */
+.ttv-player-toast-label {
+  margin-top: 9px;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: 0.4px;
+  line-height: 1.2;
+  color: rgba(255, 255, 255, 0.95);
+  /* 双层阴影：近处实、远处晕，亮暗画面上都能读 */
+  text-shadow: 0 1px 5px rgba(0, 0, 0, 0.85), 0 0 14px rgba(0, 0, 0, 0.5);
+  /* 数字（音量%、时间）用等宽数字，连按时不会左右抖 */
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 副文案：数值（音量% / 落点时间 / 集号），只在有内容时出现 */
+.ttv-player-toast-detail {
+  margin-top: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: rgba(255, 255, 255, 0.6);
+  text-shadow: 0 1px 5px rgba(0, 0, 0, 0.85);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 空副文案不占位（避免圆底下方多出一段空白） */
+.ttv-player-toast-detail:empty {
+  display: none;
+}
+
+/* 用户开了"减少动态效果"：去掉缩放与脉冲，只保留淡入淡出 */
+@media (prefers-reduced-motion: reduce) {
+  .ttv-player-toast,
+  .ttv-player-toast.is-visible {
+    transform: none;
+    transition: opacity 0.12s ease;
+  }
+
+  .ttv-player-toast-icon {
+    animation: none;
+  }
+}
+
+/* ==========================================================================
+   3.5 长按加速提示
+   ========================================================================== */
+
+/*
+  按住方向键进入临时加速时出现在画面顶部中央，松开立刻消失。
+  与全屏提示（top-6）同位置：两者不会同时出现（全屏提示是进全屏后 3.2 秒，
+  而加速只在按住方向键时才有），复用一个位置比另找一个不遮挡画面的地方简单。
+
+  刻意**不用 backdrop-filter**：本舞台内所有背景模糊都会把视频拉进合成器，
+  直接让 RTX VSR 失效（见本文件第 2 节的长注释）。这里用纯色底。
+
+  外形是一块圆角卡片，右侧的滚轮故意比卡片高 4px：上下邻居档会被卡片边缘裁掉
+  一点点，"露出半行"正是滚轮该有的层次，否则三个档位看起来只是三行文字。
+*/
+.ttv-boost-toast {
+  display: inline-flex;
+  align-items: center;
+  height: 46px;
+  /* 右边只留 8px：滚轮自带"上下邻居的半行"，贴边才不像被切掉 */
+  padding: 0 8px 0 16px;
+  border-radius: 13px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+  color: #fff;
+  font-size: 13.5px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  overflow: hidden;
+  animation: ttv-boost-in 0.14s ease-out;
+  /* 淡下去要慢（提示条已经没用了，别忽然闪一下）；点亮要快，见 :not(.is-dimmed) */
+  transition: opacity 0.9s ease;
+}
+
+/* 长按满 5 秒后自己淡下去；换档会重新点亮并重新计时（见 BoostToast） */
+.ttv-boost-toast.is-dimmed {
+  opacity: 0.3;
+}
+
+/* 不在变淡状态 = 正在（重新）点亮，用短过渡才叫"立马" */
+.ttv-boost-toast:not(.is-dimmed) {
+  transition-duration: 0.12s;
+}
+
+.ttv-boost-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  margin-right: 9px;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+/*
+  档位滚轮：当前档居中，上下各露一个相邻档（暗、小），换档时整列一起滚。
+  只显示当前值的话，用户按 ↑ / ↓ 时看不出一共几档、也不知道按到第几个了。
+*/
+.ttv-boost-wheel {
+  width: 54px;
+  /* 比卡片内容高 4px：上下各被裁 2px，邻居档几乎完整、只贴边 */
+  height: 50px;
+  margin-left: 12px;
+  overflow: hidden;
+}
+
+.ttv-boost-wheel-track {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 50px;
+  /* 邻居档中心到当前档中心的距离 = 24/2 + 13/2，滚动位移就是它 */
+  --roll-step: 18.5px;
+}
+
+.ttv-boost-wheel-row {
+  height: 13px;
+  line-height: 13px;
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.42);
+  font-variant-numeric: tabular-nums;
+}
+
+.ttv-boost-wheel-row.is-current {
+  height: 24px;
+  line-height: 24px;
+  font-size: 15.5px;
+  font-weight: 700;
+  color: #fff;
+}
+
+/*
+  整列一起位移，才是滚轮：新档从一边进来、旧档从另一边退出，邻居跟着走。
+  只让中间那行淡入淡出的话，看着就只是"数字变了"。
+  起点由 --roll-dir（±1）与 --roll-step 算出，末端带点过冲，停下时有惯性。
+
+  这里用 transform 而入场只用 opacity：位移本身就是要表达的东西。动画不保留
+  （没有 forwards），结束后回到无 transform 的状态；不变量 26 禁的是给 video
+  祖先挂**常驻**的 transform/filter，而这一层既不是 video 祖先，也不常驻。
+*/
+.ttv-boost-roll {
+  animation: ttv-boost-roll 0.26s cubic-bezier(0.2, 1.35, 0.5, 1);
+}
+
+@keyframes ttv-boost-roll {
+  from {
+    transform: translateY(calc(var(--roll-step) * var(--roll-dir, 0)));
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+/*
+  入场只做 opacity（不碰 transform）。历史教训（不变量 26）：给播放器祖先挂任何
+  会保留的 transform/filter，都会把它钉成常驻合成层并让 NVIDIA VSR 失效。
+  这一层不是 video 祖先、且只在按住键盘时存在，风险本来极低；
+  但既然纯粹用 opacity 就能达到"出现"的效果，就没必要引入第二个变量。
+*/
+@keyframes ttv-boost-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* ==========================================================================
+   4. 收起态的贴边迷你进度条
+   ========================================================================== */
+
+/*
+  纯显示件：不接受任何操作（锁定态的语义是"除解锁外一切输入失效"，
+  这里若能拖动跳转就是漏网的操作入口），所以不给 pointer 光标。
+*/
+.ttv-mini-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3.5px;
+  /*
+    底轨用**中性灰**，这是这里唯一的正确解。
+    
+    旧值是一条 rgba(255,255,255,0.22) 的纯白底轨。它在黑画面下刚好够用，但这条
+    CDN 的短剧大量是白墙 / 白西装 / 雪景这类高亮近景 —— 纯白叠纯白，实测合成后
+    与背景的亮度差为 **0**，3.5px 的线等于完全不存在。用户报的「底部的进度条
+    有时候会不见」正是这种场景：换一集暗场景又正常，所以现象是"有时候"。
+
+    反之，纯黑衬底在白画面上清楚（亮度差 107），在纯黑画面上又同样归零。
+    只有 50% 上下的中性灰能与**两种极端背景**都拉开约 70 的亮度差：
+      rgba(128,128,128,0.55) 叠白 → 约 185（差 70）；叠黑 → 约 70（差 70）。
+    上缘再补一条高光，暗场景下轮廓更明确。
+  */
+  background: var(--progress-track);
+  box-shadow:
+    0 -1px 0 rgba(255, 255, 255, 0.3),
+    /* 中性灰细描边：白色底轨在上缘高光之外再给一条不依赖背景色的轮廓，
+       极亮画面上也能看出"这里有一条线"（纯白描边在白底上等于没有）。 */
+    0 0 0 0.5px rgba(128, 128, 128, 0.45),
+    0 0 5px rgba(0, 0, 0, 0.32);
+  z-index: 35;
+  opacity: 0;
+  transform: translateY(100%);
+  pointer-events: none;
+  transition:
+    opacity 0.28s var(--curve-fluent),
+    transform 0.28s var(--curve-fluent),
+    height 0.15s ease;
+}
+
+/*
+  仅在全部浮层与控制按钮都完全收起时（组件内联 style 驱动为主要真值），才在底部展开；
+  锁定但小锁仍浮在画面上时不能提前露头。
+*/
+.is-auto-hidden:not(.is-locked) .ttv-mini-progress {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/*
+  这里曾有三条 `:hover { height: 6px }` 的加粗规则，但它们**永远不会触发**：
+  本元素设了 `pointer-events: none`（纯显示件、不接手势，见上方注释），
+  不产生指针事件的元素也就没有 hover 状态。删掉以免下次有人照它抄。
+  想加粗只能在挂载点用状态类驱动（例如容器 hover），不能挂在本元素上。
+*/
+
+.ttv-mini-buffer {
+  position: absolute;
+  inset: 0 auto 0 0;
+  /*
+    缓冲段与底轨同族、只是更亮一档：它必须与底轨**互相可分**，同时自己也要在
+    极亮/极暗两种画面上都能看见。纯白（rgba(255,255,255,*)）在白底上同样会归零，
+    所以这里也走中性灰 —— 叠白约 230（与底轨 185 差 45）、叠黑约 128（与底轨 70 差 58）。
+  */
+  background: var(--progress-buffer);
+  transition: width 0.2s linear;
+}
+
+.ttv-mini-played {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 100%;
+  /*
+    品牌蓝保留，但不再用会与亮画面糊在一起的纯色：白底叠合后只有 41 的亮度差，
+    实测那条蓝线在白西装画面上同样"看不见"。改成蓝色 + 一圈同色发光，
+    让它靠**边缘**而不是靠明度在亮背景上立住。
+  */
+  background: linear-gradient(180deg, var(--progress-played-from), var(--progress-played-to));
+  box-shadow:
+    0 0 8px var(--progress-glow),
+    /* 描边用中性灰而不是纯白：这条线要在白西装 / 雪景这类亮画面上也有轮廓。 */
+    0 0 0 0.5px rgba(128, 128, 128, 0.55);
+  /* 用 scaleX 而非 width：进度每帧更新时避免触发布局重排 */
+  transform-origin: left center;
+  will-change: transform;
+}
+
+/*
+  时长还没解析出来时的占位填充：固定铺一小段、颜色压暗，
+  明确表示"正在加载"而不是"进度为 0"。
+  它不能走 scaleX —— 那条 transform 正是用来表达进度的。
+*/
+.ttv-mini-played.is-unknown {
+  width: 28%;
+  transform: none;
+  /*
+    与已播段**同一组变量**（2026-10-19 修「进度条偶尔变色」）。
+    这里曾经是写死的红色渐变：浅色主题下时长未就绪的头一两秒，细条是红的，
+    时长一解析出来立刻变成蓝色 —— 用户看到的就是"进度条有时候会变色"。
+    改成变量后，占位与已播永远同色系，只靠不透明度区分"还没开始"。
+  */
+  background: linear-gradient(180deg, var(--progress-played-from), var(--progress-played-to));
+  opacity: 0.72;
+  box-shadow: 0 0 0 0.5px rgba(128, 128, 128, 0.55);
+  /*
+    刻意**不做**无限循环动画。原设想是加一段 opacity 呼吸提示"还在加载"，
+    但任何持续动画都会被提升为常驻合成层，而这条播放器的合成约束极其昂贵：
+    历史上正是"恒等 transform/filter 被永久钉在 video 祖先上"让 NVIDIA VSR
+    失效过一次（AGENTS.md 不变量 26）。这里的收益（多一点"在动"的暗示）
+    远小于那个风险，所以只要静态填充能表达"这里有一条进度条"就够了。
+  */
+}
+
+/* ==========================================================================
+   5. 顶部标题岛
+   ========================================================================== */
+
+.ttv-top-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  pointer-events: auto;
+  transition: transform 0.3s var(--curve-fluent);
+}
+
+.title-crystal-island {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px 6px 8px;
+  border-radius: 14px;
+  min-width: 0;
+}
+
+.crystal-divider {
+  width: 1px;
+  height: 16px;
+  background: rgba(255, 255, 255, 0.22);
+  flex-shrink: 0;
+}
+
+.drama-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #fff;
+  letter-spacing: -0.1px;
+  max-width: 260px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.episode-badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fluent-sky);
+  background: rgba(0, 120, 212, 0.25);
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  padding: 2px 8px;
+  border-radius: 6px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* ==========================================================================
+   6. 底部操控坞（统一大卡片：进度槽与控件同处一张晶体卡片内）
+   ========================================================================== */
+
+.ttv-dock {
+  width: 100%;
+  max-width: 880px;
+  margin: 0 auto;
+  pointer-events: auto;
+  transition: transform 0.3s var(--curve-fluent);
+}
+
+.mica-crystal-card {
+  padding: 8px 16px;
+  border-radius: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.controls-deck-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+}
+
+/* ==========================================================================
+   7. 内嵌式进度槽
+   ========================================================================== */
+
+.ttv-progress {
+  position: relative;
+  height: 16px;
+  padding: 0 2px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.progress-track {
+  position: relative;
+  width: 100%;
+  height: 4px;
+  background: var(--progress-track);
+  border-radius: 9999px;
+  transition: height 0.15s ease;
+}
+
+.ttv-progress:hover .progress-track,
+.ttv-progress.is-scrubbing .progress-track {
+  height: 6px;
+}
+
+html.kbd-nav .ttv-progress:focus-visible {
+  outline: 2px solid var(--fluent-sky);
+  outline-offset: 4px;
+  border-radius: 8px;
+}
+
+.progress-buffer {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--progress-buffer);
+  border-radius: 9999px;
+}
+
+.progress-played {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: linear-gradient(90deg, var(--progress-played-from), var(--progress-played-to));
+  border-radius: 9999px;
+  transform-origin: left center;
+  will-change: transform;
+}
+
+.progress-thumb {
+  position: absolute;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  background: #fff;
+  border: 2px solid var(--progress-played-to);
+  border-radius: 50%;
+  box-shadow: 0 0 6px var(--progress-glow);
+  transform: translate(-50%, -50%) scale(0);
+  transition: transform 0.15s ease;
+  pointer-events: none;
+}
+
+.ttv-progress:hover .progress-thumb,
+.ttv-progress.is-scrubbing .progress-thumb {
+  transform: translate(-50%, -50%) scale(1);
+}
+
+/* 悬停时间预览 */
+.ttv-progress-hint {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%);
+  padding: 2px 7px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 7px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* ==========================================================================
+   8. 按钮族
+   ========================================================================== */
+
+.btn-fluent-action {
+  background: transparent;
+  border: none;
+  padding: 7px;
+  border-radius: 10px;
+  color: #fff;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.16s var(--curve-spring), background-color 0.15s ease, color 0.15s ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .btn-fluent-action:hover {
+    color: var(--fluent-sky);
+    background: rgba(255, 255, 255, 0.14);
+    transform: translateY(-1px) scale(1.04);
+  }
+}
+
+.btn-fluent-action:active {
+  transform: translateY(1px) scale(0.94);
+  transition-duration: 0.1s;
+}
+
+html.kbd-nav .btn-fluent-action:focus-visible {
+  transform: translateY(-1px);
+}
+
+.btn-fluent-action:disabled {
+  opacity: 0.42;
+  cursor: default;
+}
+
+.btn-fluent-action:disabled:hover {
+  color: #fff;
+  background: transparent;
+}
+
+/* 播放主键：纯蓝正圆 */
+.btn-play-hero {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--fluent-blue);
+  border: none;
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 6px rgba(0, 120, 212, 0.25);
+  cursor: pointer;
+  margin: 0 2px;
+  transition: transform 0.18s var(--curve-spring), background-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.btn-play-hero:hover {
+  background: var(--fluent-blue-hover);
+  transform: scale(1.04);
+  box-shadow: 0 3px 8px rgba(0, 120, 212, 0.3);
+}
+
+.btn-play-hero:active {
+  transform: translateY(1px) scale(0.94);
+  transition-duration: 0.1s;
+}
+
+/* 右侧文字按键（清晰度 / 倍速 / 选集 / 增强状态） */
+.btn-text-action {
+  background: transparent;
+  border: none;
+  padding: 6px 11px;
+  border-radius: 10px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  color: rgba(255, 255, 255, 0.92);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+  transition: transform 0.16s var(--curve-spring), background-color 0.15s ease, color 0.15s ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .btn-text-action:hover {
+    color: var(--fluent-sky);
+    background: rgba(255, 255, 255, 0.14);
+    transform: translateY(-1px) scale(1.035);
+  }
+}
+
+.btn-text-action:active {
+  transform: translateY(1px) scale(0.95);
+  transition-duration: 0.1s;
+}
+
+.btn-text-action:disabled {
+  color: rgba(255, 255, 255, 0.38);
+  cursor: default;
+}
+
+.btn-text-action:disabled:hover {
+  background: transparent;
+}
+
+.btn-text-action.is-on {
+  color: var(--fluent-sky);
+  background: rgba(56, 189, 248, 0.18);
+}
+
+/* 长按方向键加速期间：倍速按键高亮为"Nx 加速"，与画面中央的提示条相互印证。 */
+.btn-text-action.is-boosting {
+  color: #0b1220;
+  background: var(--fluent-sky);
+  font-weight: 600;
+}
+
+/*
+  倍速菜单底部的说明行（"长按 ← / → 加速到 Nx"）。
+  它随所选档位变化，是唯一能把"加速倍率 = 档位 × 3"这件事讲清楚的地方。
+*/
+.crystal-menu-note {
+  margin-top: 4px;
+  padding: 7px 12px 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.14);
+  font-size: 11px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.62);
+  white-space: nowrap;
+}
+
+.svg-icon {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
+}
+
+/* ==========================================================================
+   9. 滚动数字读数（ReactBits 风格机械滚轮）
+   ========================================================================== */
+
+.ttv-time {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 2px;
+  font-family: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  flex-shrink: 0;
+}
+
+.rolling-counter {
+  display: inline-flex;
+  align-items: center;
+  height: var(--roller-h);
+  line-height: var(--roller-h);
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+}
+
+.rolling-counter.is-duration {
+  color: rgba(255, 255, 255, 0.72);
+  font-weight: 500;
+}
+
+.roller-col {
+  position: relative;
+  display: inline-block;
+  width: 8.5px;
+  height: var(--roller-h);
+  overflow: hidden;
+  vertical-align: middle;
+  /* 上下羽化遮罩：数字自虚空滑入 / 滑出 */
+  mask-image: linear-gradient(to bottom, transparent 0%, #000 22%, #000 78%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 22%, #000 78%, transparent 100%);
+}
+
+.roller-col.is-pct {
+  width: 7.5px;
+}
+
+.roller-list {
+  display: flex;
+  flex-direction: column;
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  transition: transform 0.38s var(--curve-fluent);
+  /*
+    ⚠️ **不写 `will-change: transform`**（2026-10-22 修「播放器动画卡顿」）。
+
+    这里原本挂着它，而 `.roller-list` 在一集播放器里有 **6 个**（时:分的四位
+    数字 + 冒号两侧各一组）。`will-change` 会给每个元素分配独立的合成层，
+    于是光时间读数就常驻 6 个层 —— 实测整个应用有 13 个 will-change 元素，
+    其中 6 个是它。
+
+    为什么可以直接去掉：`.roller-list` 的位移是 `translateY`，浏览器对
+    transform 动画本来就会在**动画期间**自动提升为合成层，结束后释放。手动
+    挂 `will-change` 唯一的作用是"提前"提升，而这里的动画由用户交互（切集、
+    调音量）触发、频率极低，提前提升毫无收益，只剩常驻开销。
+
+    这与 `MicaCard` 里那条"不加 will-change-transform"的结论同源：合成层
+    不是免费的，成批重复的元素尤其不能挂。
+  */
+}
+
+.roller-list span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--roller-h);
+  line-height: var(--roller-h);
+  width: 100%;
+  font-size: 13px;
+  font-weight: 600;
+  color: inherit;
+}
+
+.roller-col.is-pct .roller-list span {
+  font-size: 11px;
+}
+
+.roller-colon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 5px;
+  height: var(--roller-h);
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 13px;
+  margin: 0 1px;
+}
+
+.roller-suffix {
+  font-size: 10px;
+  font-weight: 700;
+  margin-left: 1px;
+  color: inherit;
+}
+
+.time-sep {
+  margin: 0 6px;
+  color: rgba(255, 255, 255, 0.35);
+  font-weight: 400;
+  font-size: 12px;
+}
+
+/* ==========================================================================
+   10. 上浮气泡（清晰度 / 倍速菜单、垂直音量柱）
+   ========================================================================== */
+
+.crystal-flyout {
+  position: absolute;
+  bottom: calc(100% + 14px);
+  left: 50%;
+  transform: translateX(-50%) translateY(8px) scale(0.96);
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s ease, transform 0.22s var(--curve-spring);
+  transform-origin: bottom center;
+  z-index: 50;
+  min-width: 112px;
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.crystal-flyout.open {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0) scale(1);
+}
+
+.crystal-menu-item {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 34px;
+  background: transparent;
+  border: none;
+  padding: 7px 12px;
+  border-radius: 9px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  color: rgba(255, 255, 255, 0.88);
+  cursor: pointer;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  transition: transform 0.16s var(--curve-spring), background-color 0.15s ease, color 0.15s ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .crystal-menu-item:hover {
+    background: rgba(255, 255, 255, 0.16);
+    color: #fff;
+    transform: translateY(-1px);
+  }
+}
+
+.crystal-menu-item:active {
+  transform: translateY(1px) scale(0.97);
+  transition-duration: 0.1s;
+}
+
+.crystal-menu-item.active {
+  background: var(--fluent-blue);
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(0, 120, 212, 0.4);
+}
+
+.crystal-menu-check {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  stroke-width: 2.5;
+}
+
+/* ==========================================================================
+   10b. 视频增强浮层（播放页「增强」按钮：VSR 开关 + 补帧预留位）
+   ========================================================================== */
+
+/*
+  比清晰度 / 倍速菜单宽：它承载的是「开关 + 两行说明」，不是一列档位。
+  定位改成右对齐（right 而不是 left: 50%）：宽度一旦超过按钮到窗口右边缘的
+  距离，居中就会把面板推出屏幕外。
+
+  ⚠️ 这里只覆盖几何与排布，**不引入任何 backdrop-filter / filter**：
+  `.ttv-video-stage` 内的模糊会把视频拉进合成器，直接让 RTX VSR 失效
+  （见本文件顶部第 2 节与不变量 26）。
+*/
+.crystal-flyout.ttv-enhance-flyout {
+  left: auto;
+  right: -6px;
+  /* 比其它气泡更贴近按钮（默认 14px）：这块浮层高约 220px，向上展开时底边
+     正好压在进度槽上；6px 已经是"不贴脸"的下限，能少遮一条槽。 */
+  bottom: calc(100% + 6px);
+  transform: translateY(8px) scale(0.96);
+  transform-origin: bottom right;
+  min-width: 262px;
+  max-width: 292px;
+  padding: 8px;
+  gap: 4px;
+}
+
+.crystal-flyout.ttv-enhance-flyout.open {
+  transform: translateY(0) scale(1);
+}
+
+.ttv-enhance-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 2px 8px 7px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.ttv-enhance-head-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: 0.2px;
+}
+
+/* 「切换后立即重载本集」：这是用户唯一能预判"画面会短暂准备一下"的提示。 */
+.ttv-enhance-head-hint {
+  font-size: 10.5px;
+  /* 浮层是半透明的（舞台内禁用 backdrop-filter，见第 2 节）：亮画面上 0.55 的
+     白字合成后对比不足 2:1，提到 0.72 才接近可读。暗色主题同样吃这一条。 */
+  color: rgba(255, 255, 255, 0.72);
+  white-space: nowrap;
+}
+
+/* 一行 = 一个能力。整行可点（.crystal-menu-item 那种"点按钮"的密度太小，
+   说明文字放不下），与设置页 toggle 行的手感一致。 */
+.ttv-enhance-row {
+  /* button 默认 box-sizing 不一定被全局 reset 覆盖：width:100% + padding 会把
+     右侧开关挤出浮层，点击区域落到浮层外，表现就是"点不动"。 */
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: transform 0.16s var(--curve-spring), background-color 0.15s ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .ttv-enhance-row:hover {
+    background: rgba(255, 255, 255, 0.14);
+    transform: translateY(-1px);
+  }
+}
+
+.ttv-enhance-row:active {
+  transform: translateY(1px) scale(0.985);
+  transition-duration: 0.1s;
+}
+
+/* 提高一级特异性：`.ttv-player button:focus-visible`（crystal.css 末尾）是 (0,2,1)，
+   而动漫播放器的根类含 `ttv-player`、短剧不含 —— 同一条焦点环会在两个播放器里
+   长得不一样。这里写成同样的形状，胜负只由"后定义"决定。 */
+html.kbd-nav .ttv-player .ttv-enhance-row:focus-visible,
+html.kbd-nav .ttv-enhance-row:focus-visible {
+  outline: 2px solid rgba(56, 189, 248, 0.7);
+  outline-offset: 1px;
+}
+
+/* 补帧预留位已在发布前移除，对应的 `.is-disabled` / `.ttv-enhance-badge`
+   一组样式一并删掉（没有使用者的样式比没有样式更糟：下次改这里会以为它还活着）。 */
+
+.ttv-enhance-label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+
+.ttv-enhance-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.ttv-enhance-row.is-disabled .ttv-enhance-title {
+  color: rgba(255, 255, 255, 0.58);
+}
+
+.ttv-enhance-desc {
+  font-size: 11px;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.72);
+  white-space: normal;
+}
+
+/*
+  开关：与设置页 Toggle 同一套语义，尺寸缩到浮层密度。
+  只用 background-color 与**小滑块**的 transform，不做模糊、也不给整行挂
+  常驻 transform —— 舞台内任何把 video 拉进合成器的东西都会打掉 VSR。
+*/
+.ttv-enhance-switch {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  width: 30px;
+  height: 18px;
+  padding: 2px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.22);
+  transition: background-color 0.18s ease;
+  flex-shrink: 0;
+}
+
+.ttv-enhance-switch.is-on {
+  background: var(--fluent-blue, #0078d4);
+}
+
+.ttv-enhance-knob {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  transform: translateX(0);
+  transition: transform 0.18s var(--curve-fluent, cubic-bezier(0.2, 0.9, 0.3, 1));
+}
+
+.ttv-enhance-switch.is-on .ttv-enhance-knob {
+  transform: translateX(12px);
+}
+
+/* 垂直音量柱 */
+.crystal-volume-bubble {
+  position: absolute;
+  bottom: calc(100% + 14px);
+  left: 50%;
+  transform: translateX(-50%) translateY(8px) scale(0.96);
+  width: 46px;
+  height: 156px;
+  border-radius: 14px;
+  padding: 10px 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  z-index: 50;
+  overflow: hidden;
+}
+
+.crystal-volume-bubble.open {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0) scale(1);
+}
+
+.vol-track-vertical {
+  position: relative;
+  width: 24px;
+  height: 94px;
+  margin: 6px 0;
+  display: flex;
+  justify-content: center;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.vol-track-bg {
+  position: absolute;
+  width: 4px;
+  height: 100%;
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 9999px;
+}
+
+.vol-track-fill {
+  position: absolute;
+  bottom: 0;
+  width: 4px;
+  background: var(--fluent-blue);
+  border-radius: 9999px;
+  /* 从底部向上生长：固定 100% 高度用缩放表达，避免逐帧改 height */
+  height: 100%;
+  transform-origin: center bottom;
+  will-change: transform;
+}
+
+.vol-track-thumb {
+  position: absolute;
+  left: 50%;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid var(--fluent-blue);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  transform: translate(-50%, 50%);
+  pointer-events: none;
+  transition: transform 0.12s ease;
+}
+
+.vol-track-vertical:hover .vol-track-thumb {
+  transform: translate(-50%, 50%) scale(1.15);
+}
+
+.vol-mute-btn {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border-radius: 6px;
+  color: rgba(255, 255, 255, 0.85);
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.vol-mute-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+  color: var(--fluent-sky);
+}
+
+/* ==========================================================================
+   11. 下一集连播倒计时卡片
+   ========================================================================== */
+
+/* ==========================================================================
+   12. 选集巨幕
+   ========================================================================== */
+
+.ttv-drawer-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 26px;
+  background: rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.28s ease;
+}
+
+.ttv-drawer-overlay.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.crystal-drawer-box {
+  position: relative;
+  width: 100%;
+  max-width: 820px;
+  max-height: 84vh;
+  border-radius: 26px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transform: scale(0.96) translateY(12px);
+  transition: transform 0.28s var(--curve-fluent);
+}
+
+.ttv-drawer-overlay.open .crystal-drawer-box {
+  transform: scale(1) translateY(0);
+}
+
+.drawer-top-header {
+  height: 58px;
+  padding: 0 22px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  flex-shrink: 0;
+}
+
+.drawer-ep-grid {
+  padding: 20px 24px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(68px, 1fr));
+  gap: 10px;
+  overflow-y: auto;
+  max-height: 56vh;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+}
+
+/* 播放器深色场景下滚动条要比全局浅色版本更亮，否则看不见 */
+.ttv-player ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.ttv-player ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.ep-card-item {
+  position: relative;
+  height: 44px;
+  border-radius: 12px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.88);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+  transition: background-color 0.15s var(--curve-fluent),
+    border-color 0.15s var(--curve-fluent),
+    color 0.15s var(--curve-fluent),
+    transform 0.15s var(--curve-fluent),
+    box-shadow 0.15s var(--curve-fluent);
+}
+
+.ep-card-item:hover {
+  background: rgba(255, 255, 255, 0.2);
+  border-color: rgba(56, 189, 248, 0.6);
+  color: var(--fluent-sky);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.ep-card-item.active {
+  background: var(--fluent-blue);
+  border-color: rgba(255, 255, 255, 0.35);
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(0, 120, 212, 0.45);
+}
+
+/* 深色播放器内的输入框（选集搜索） */
+.ttv-field {
+  height: 30px;
+  font-family: inherit;
+  font-size: 12px;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 9px;
+  outline: none;
+  transition: border-color 0.15s, background-color 0.15s, box-shadow 0.18s var(--curve-fluent);
+}
+
+.ttv-field::placeholder {
+  color: rgba(255, 255, 255, 0.42);
+}
+
+/* 聚焦用双环（内圈压白、外圈晕天蓝），与 index.css 的 `.ttv-input` 同一套
+   语汇——浅色页面的搜索框与播放器里的选集搜索框，聚焦时应该是同一个动作。
+
+   这里**不能**用 outline：`.ttv-drawer-box` 是 `overflow: hidden` 的抽屉，
+   outline 会被裁掉一半（项目里 TitleBar 搜索框踩过同一个坑）。也**不能**用
+   backdrop-filter 做发光——播放器舞台内一切背景模糊都会把视频拉进合成器，
+   打掉 RTX VSR（不变量 26）。box-shadow 是纯绘制、不取样背景，安全。
+
+   内圈用白色而不是品牌色：底是 10% 白的深色玻璃，品牌蓝在这个底色上对比度
+   不够，读不出"咬合"；白色内圈在任何视频画面上都稳定。 */
+.ttv-field:focus {
+  border-color: rgba(56, 189, 248, 0.55);
+  background: rgba(255, 255, 255, 0.14);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.42),
+    0 0 0 3px rgba(56, 189, 248, 0.22);
+}
+
+/* 分组药丸（1-50 / 51-100 ...） */
+.ttv-chips {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.ttv-chip {
+  padding: 4px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.75);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.ttv-chip:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.ttv-chip.is-active {
+  background: var(--fluent-blue);
+  color: #fff;
+}
+
+/* ==========================================================================
+   13. 焦点可见性与动效偏好
+   ========================================================================== */
+
+html:not(.kbd-nav) :is(.ttv-player, .ttv-hud, .ttv-video-stage) *:focus-visible {
+  outline: none !important;
+}
+
+html.kbd-nav .ttv-player button:focus-visible,
+html.kbd-nav .ttv-hud button:focus-visible {
+  outline: 2px solid var(--fluent-sky);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ttv-hud,
+  .ttv-lock,
+  .ttv-mini-progress,
+  .crystal-flyout,
+  .crystal-volume-bubble,
+  .crystal-drawer-box,
+  .ttv-drawer-overlay,
+  .roller-list,
+  .ep-card-item,
+  /* 增强浮层里的开关滑块（2026-10-25）：漏了它，减动效偏好下拨开关仍有位移。 */
+  .ttv-enhance-switch,
+  .ttv-enhance-knob {
+    transition-duration: 0.01ms !important;
+  }
+
+  .btn-fluent-action:hover,
+  .btn-fluent-action:active,
+  .btn-text-action:hover,
+  .btn-text-action:active,
+  .btn-play-hero:hover,
+  .btn-play-hero:active,
+  .crystal-menu-item:hover,
+  .crystal-menu-item:active,
+  .ttv-enhance-row:hover,
+  .ttv-enhance-row:active {
+    transform: none !important;
+  }
+}
+
+/* ==========================================================================
+   14. 窄窗口适配
+   ========================================================================== */
+
+@media (max-width: 760px) {
+  .ttv-hud {
+    padding: 14px;
+  }
+
+  .drama-title {
+    max-width: 170px;
+  }
+
+  .ttv-dock {
+    max-width: 100%;
+  }
+
+  .mica-crystal-card {
+    padding: 7px 12px;
+  }
+
+  .controls-deck-row {
+    gap: 8px;
+  }
+
+  .ttv-time {
+    display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .ttv-hud {
+    padding: 10px 10px 12px;
+  }
+
+  .title-crystal-island {
+    gap: 7px;
+    padding: 5px 10px 5px 6px;
+  }
+
+  .drama-title {
+    max-width: 120px;
+    font-size: 12.5px;
+  }
+
+  .mica-crystal-card {
+    padding: 6px 10px;
+    border-radius: 14px;
+  }
+
+  .controls-deck-row {
+    gap: 6px;
+  }
+
+  .controls-deck-row .crystal-divider {
+    display: none;
+  }
+
+  .btn-fluent-action {
+    padding: 5px;
+    border-radius: 8px;
+  }
+
+  .btn-play-hero {
+    width: 34px;
+    height: 32px;
+    border-radius: 10px;
+  }
+
+  .btn-text-action {
+    padding: 0 7px;
+    height: 28px;
+    font-size: 11px;
+    gap: 3px;
+  }
+}
+
+
+/* 矮窗口里错误卡片不能盖住底部控制坞，也不能把主要操作挤出视口。 */
+@media (max-height: 560px) {
+  .player-error-overlay {
+    box-sizing: border-box;
+  }
+
+  .player-error-overlay:not(.is-compact) {
+    align-items: flex-start;
+    justify-content: flex-start;
+    overflow-y: auto;
+    padding-bottom: 112px;
+    padding-top: 12vh;
+  }
+
+  .player-error-overlay.is-compact {
+    bottom: 112px;
+  }
+}
+
+/* ==========================================================================
+   10c. 播放器三浮层统一量宽（2026-11-05）
+   --------------------------------------------------------------------------
+   问题：清晰度 / 倍速 / 增强三个浮层的宽度各算各的 ——
+     - `.crystal-flyout` 只有 min-width: 112px，宽度由内容撑开：清晰度菜单
+       （"1080P 蓝光"这类短文本）窄，倍速菜单被底部那行长提示撑宽；
+     - 增强浮层单独写死 min-width: 262px / max-width: 292px。
+   同一排按钮弹出的三个面板宽度全不一样，用户的原话是"有的长、有的宽、有的小"。
+
+   现在三处共用 248px 一条宽度：档位文本短、居中偏移一致，面板边界在三次点击
+   之间不再跳动。倍速菜单底部那行说明改成可换行（原来 nowrap 会硬撑宽度）。
+
+   ⚠️ 依旧不引入 backdrop-filter / filter：`.ttv-video-stage` 内的模糊会把视频
+   拉进合成器，直接让 RTX VSR 失效（见本文件顶部第 2 节与不变量 26）。
+   ========================================================================== */
+.crystal-flyout.ttv-flyout-fixed {
+  width: 248px;
+  min-width: 0;
+  max-width: 248px;
+}
+
+/* 增强浮层保留自己右对齐的定位，只把宽度并入同一条规格 */
+.crystal-flyout.ttv-enhance-flyout.ttv-flyout-fixed {
+  width: 248px;
+  min-width: 0;
+  max-width: 248px;
+}
+
+.ttv-flyout-fixed .crystal-menu-item {
+  white-space: normal;
+  text-align: left;
+}
+
+.ttv-flyout-fixed .crystal-menu-note {
+  white-space: normal;
+  line-height: 1.45;
+}
+
+/* ==========================================================================
+   10d. 弹幕设置面板（2026-11-07）
+
+   与清晰度/倍速/增强同一套 `.crystal-flyout` 材质，但**不并入 ttv-flyout-fixed
+   的 248px 规格**：面板里有「标签 + 滑条 + 读数」三列，248px 会把滑条压到
+   不足 120px、拖动分辨率太差。300px 是三列都能呼吸的下限，右对齐定位沿用
+   增强浮层的锚点（right: -6px）。
+
+   面板只在弹幕开启时渲染（PlayerHud 按条件挂载），关闭后按钮序列自动回到
+   原样——这里不需要 display:none 的隐藏态。
+   ========================================================================== */
+.crystal-flyout.ttv-danmaku-flyout {
+  left: auto;
+  right: -6px;
+  bottom: calc(100% + 6px);
+  transform: translateY(8px) scale(0.96);
+  width: 300px;
+  min-width: 0;
+  max-width: 300px;
+  padding: 8px;
+  gap: 2px;
+}
+
+.crystal-flyout.ttv-danmaku-flyout.open {
+  transform: translateY(0) scale(1);
+}
+
+.ttv-danmaku-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 6px;
+}
+
+.ttv-danmaku-label {
+  flex: none;
+  width: 56px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.82);
+  white-space: nowrap;
+}
+
+/* 滑条走原生 input[type=range] + accent-color：与 MiniPlayer 音量条同一方案，
+   不自己画轨道（自绘要在 .ttv-video-stage 里避开 backdrop-filter 陷阱，不值）。 */
+.ttv-danmaku-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 4px;
+  accent-color: #38bdf8;
+  cursor: pointer;
+}
+
+.ttv-danmaku-value {
+  flex: none;
+  width: 38px;
+  text-align: right;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.ttv-danmaku-divider {
+  height: 1px;
+  margin: 4px 6px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.ttv-danmaku-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(15, 23, 42, 0.9);
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ttv-danmaku-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.85);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ttv-danmaku-check input {
+  accent-color: #38bdf8;
+  cursor: pointer;
+}
+
+.ttv-danmaku-strokes {
+  display: flex;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.ttv-danmaku-stroke {
+  flex: 1 1 0;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.ttv-danmaku-stroke:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.ttv-danmaku-stroke.is-active {
+  background: #38bdf8;
+  border-color: #38bdf8;
+  color: #0b1220;
+  font-weight: 700;
+}
+
+.ttv-danmaku-reset {
+  display: block;
+  width: calc(100% - 12px);
+  height: 30px;
+  margin: 6px 6px 2px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.88);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.ttv-danmaku-reset:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* 弹幕颜色色板：9 个预设圆点 + 1 个彩虹自定义取色器（原生 color input 包皮）。 */
+.ttv-danmaku-swatches {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.ttv-danmaku-swatch {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.28);
+  padding: 0;
+  cursor: pointer;
+  position: relative;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.ttv-danmaku-swatch:hover {
+  border-color: rgba(255, 255, 255, 0.6);
+}
+
+.ttv-danmaku-swatch.is-active {
+  border-color: #38bdf8;
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.35);
+}
+
+.ttv-danmaku-swatch-custom {
+  background: conic-gradient(#f43f5e, #f59e0b, #22c55e, #3b82f6, #a855f7, #f43f5e);
+  overflow: hidden;
+}
+
+.ttv-danmaku-swatch-custom input {
+  position: absolute;
+  inset: -4px;
+  width: calc(100% + 8px);
+  height: calc(100% + 8px);
+  opacity: 0;
+  cursor: pointer;
+}

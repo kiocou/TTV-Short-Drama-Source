@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      播放源 CDN（qznovelvod.com）会校验 Referer 并拒绝来自本机来源的请求：
+        无 Referer            -> 206 Partial Content ✓
+        Referer: localhost    -> 403 Forbidden      ✗
+        Referer: hongguoduanju.com -> 206 ✓
+      开发态页面源是 http://127.0.0.1:5175，打包后是 tauri://localhost，
+      两者都会被 CDN 拒绝，导致 <video> 直链播放失败。
+      这里统一不带 Referer，实测视频与封面图（byteimg.com）均可正常加载。
+    -->
+    <meta name="referrer" content="no-referrer" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="apple-touch-icon" href="/app-icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TTV Short Drama - 极简短剧播放器</title>
+    <!--
+      字体：刻意不引外部 Web Font。
+      一是 CSP（style-src 'self' / 未开放 font-src）本就把它拦掉，只在启动时
+      留下一次失败请求与控制台报错；二是本应用面向 Windows 11，Segoe UI
+      Variable 才是与 Mica 材质同源的系统字体（见 tailwind.config.js 的
+      font-fluent）。离线场景下外链字体也只会拖慢首屏。
+    -->
+  </head>
+  <body class="bg-[#f3f5f8] text-[#0f172a] font-fluent select-none overflow-hidden antialiased">
+    <div id="root" class="w-screen h-screen overflow-hidden">
+      <style>
+        .ttv-prepaint{width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:radial-gradient(64% 64% at 50% 42%,rgba(109,71,230,.08),transparent 70%),#f3f5f8;color:#475569;font-size:12px;letter-spacing:.04em}
+        .ttv-prepaint-dot{width:10px;height:10px;border-radius:999px;background:#6d47e6;animation:ttvPrePulse 1s ease-in-out infinite}
+        @media (prefers-color-scheme:dark){.ttv-prepaint{background:radial-gradient(64% 64% at 50% 42%,rgba(220,38,38,.12),transparent 70%),#0e1015;color:#94a3b8}.ttv-prepaint-dot{background:#ef4444}}
+        @keyframes ttvPrePulse{0%,100%{transform:scale(.85);opacity:.45}50%{transform:scale(1.15);opacity:1}}
+      </style>
+      <div class="ttv-prepaint" aria-hidden="true">
+        <span class="ttv-prepaint-dot"></span>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  frontend:
+    name: Frontend & Verify Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript & Vite build
+        run: npm run build
+
+      - name: Run verification scripts
+        run: |
+          npm run verify:huangguo
+          npm run verify:playback-routing
+          npm run verify:native-player
+          npm run verify:horizontal-rails
+          npm run verify:scroll-edges
+          npm run verify:resume
+          npm run verify:feed-latency
+          npm run verify:feed-source
+          npm run verify:feed-playback
+
+  rust:
+    name: Rust (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            native: true
+            ttv_player: true
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            native: false
+            ttv_player: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            native: true
+            ttv_player: false
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            native: false
+            ttv_player: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+          key: ${{ matrix.target }}
+
+      - name: Build frontend dist for Tauri context
+        run: |
+          npm ci
+          npm run build
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Clippy & tests (native host)
+        if: matrix.native
+        run: |
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path src-tauri/Cargo.toml --bins
+
+      - name: Cross-target check
+        if: ${{ !matrix.native }}
+        run: cargo check --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Native player helper checks (ttv-player)
+        if: matrix.ttv_player
+        run: |
+          cargo clippy --manifest-path src-tauri/ttv-player/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path src-tauri/ttv-player/Cargo.toml

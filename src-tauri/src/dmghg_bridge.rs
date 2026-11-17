@@ -1,0 +1,1811 @@
+//! dmghg（动漫共和国概念版）源桥接。
+//!
+//! 直接加载厂商的 `electron_bridge` DLL 并调用它的 JSON RPC：鉴权、DoH 网关发现、
+//! 播放地址解析全部在 DLL 内部完成，返回的已经是解密后的 JSON。
+//!
+//! **为什么不自己实现请求头**：`authentication` 头的密钥是运行时与服务端协商出来的，
+//! 不在客户端二进制里，且服务端有防重放（重放旧头会回 `403502`）。这条结论看过就够，
+//! 不要再去试——**正确做法是直接走厂商 DLL**，鉴权全在它内部完成。
+//!
+//! **两个必须记住的坑**：
+//! 1. `DMGHG_LEGACY_DIRECT_HOST` 必须在 `dmghg_service_new` **之前**设成
+//!    `http://bkbfdm.hzhcbkj.cn`。不设的话 legacy 家族会走网关发现池
+//!    `175.178.11.16:7862`，对 `pc/*` 一律返回 HTTP 418。
+//! 2. 取播放地址时 `part` 是**集名字符串**（`"第01集"`）、`play` 是**线路代码**
+//!    （`"cn"`）。传数字一律 `400404 查询无果`。
+
+use std::ffi::CString;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+use serde_json::{json, Value};
+
+use crate::models::{
+    CatalogFilter, CatalogPage, EpisodeItem, SeriesDetail, SeriesItem, VideoQualityOption,
+};
+
+/// dmghg 剧集 id 前缀。
+///
+/// 两个源的 id 都是纯数字（dmghg `181655` / 暴风 `158973`）且可能撞号，
+/// 而历史与收藏按 id 存库，所以必须加前缀区分来源。
+pub const ID_PREFIX: &str = "dmghg:";
+
+/// 一档清晰度：来源只给中文名（`4K 超清` / `1080P 高清`），且 `width`/`height`
+/// 字段恒为 0，所以高度只能从名字里解析。
+#[derive(Debug, Clone)]
+pub struct PlayVariant {
+    pub name: String,
+    pub url: String,
+    pub height: u32,
+}
+
+/// 集 id 用 `线路|集名` 编码（取播放地址时两个值都要用）。
+const EPISODE_SEP: char = '|';
+
+const DEFAULT_LEGACY_HOST: &str = "http://bkbfdm.hzhcbkj.cn";
+const PROTOCOL_VERSION: u32 = 1;
+/// 解析脚本会校验版本白名单（1.3.8~1.4.4），不在名单内会返回"引导视频"。
+const SPOOF_APP_VERSION: &str = "1.4.4";
+
+static REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// Kernel32 FFI
+//
+// 自己声明而不走 windows-sys：只需要 3 个函数，省得受 feature 组合牵制。
+// ---------------------------------------------------------------------------
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryExW(
+        file_name: *const u16,
+        file: *mut std::ffi::c_void,
+        flags: u32,
+    ) -> *mut std::ffi::c_void;
+    fn GetProcAddress(module: *mut std::ffi::c_void, name: *const u8) -> *mut std::ffi::c_void;
+    fn AddDllDirectory(path: *const u16) -> *mut std::ffi::c_void;
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+const LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR: u32 = 0x0000_0100;
+#[cfg(all(windows, target_arch = "x86_64"))]
+const LOAD_LIBRARY_SEARCH_USER_DIRS: u32 = 0x0000_0400;
+#[cfg(all(windows, target_arch = "x86_64"))]
+const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn wide(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// 加载 DLL：先试"用户目录 + 默认目录"（配合 `AddDllDirectory`），失败再试
+/// "DLL 自身目录 + 默认目录"。两次都不动进程级搜索路径。
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn load_library(dll: &Path, search_dir: &Path) -> Result<*mut std::ffi::c_void, String> {
+    let dll_wide = wide(dll);
+    let dir_wide = wide(search_dir);
+
+    unsafe {
+        AddDllDirectory(dir_wide.as_ptr());
+
+        let module = LoadLibraryExW(
+            dll_wide.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_USER_DIRS | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        );
+        if !module.is_null() {
+            return Ok(module);
+        }
+        let module = LoadLibraryExW(
+            dll_wide.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        );
+        if !module.is_null() {
+            return Ok(module);
+        }
+    }
+    Err(format!("加载失败: {}", dll.display()))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn symbol(module: *mut std::ffi::c_void, name: &str) -> Result<*mut std::ffi::c_void, String> {
+    let cname = CString::new(name).map_err(|_| "符号名含 NUL".to_string())?;
+    let address = unsafe { GetProcAddress(module, cname.as_ptr() as *const u8) };
+    if address.is_null() {
+        return Err(format!("导出不存在: {name}"));
+    }
+    Ok(address)
+}
+
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+fn load_library(_dll: &Path, _search_dir: &Path) -> Result<*mut std::ffi::c_void, String> {
+    Err("dmghg 桥接仅支持 Windows x64".to_string())
+}
+
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+fn symbol(_module: *mut std::ffi::c_void, name: &str) -> Result<*mut std::ffi::c_void, String> {
+    Err(format!("导出不存在: {name}"))
+}
+
+// ---------------------------------------------------------------------------
+// 导出函数的签名
+//
+// 安装目录那份 DLL 的导出是"转发 thunk"：内部 loader 跑完后 jmp 到真身，
+// rcx/rdx 原样透传，所以直接按真身签名调用即可。
+// ---------------------------------------------------------------------------
+
+type ServiceNewFn =
+    unsafe extern "system" fn(*const u8, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+type HandleCommandFn = unsafe extern "system" fn(*mut std::ffi::c_void, *const u8) -> *mut u8;
+type StringFreeFn = unsafe extern "system" fn(*mut u8);
+type ServiceFreeFn = unsafe extern "system" fn(*mut std::ffi::c_void);
+
+// ---------------------------------------------------------------------------
+// 桥接本体
+// ---------------------------------------------------------------------------
+
+pub struct DmghgBridge {
+    service: *mut std::ffi::c_void,
+    handle_command: HandleCommandFn,
+    string_free: StringFreeFn,
+    service_free: ServiceFreeFn,
+    _module: *mut std::ffi::c_void,
+    install_dir: PathBuf,
+}
+
+// service 句柄是裸指针。DLL 内部状态未知，这里假定它不可并发调用，
+// 由外层的 Mutex 串行化（见 `shared()`）。模块与 service 都是进程级常驻，
+// 不随线程迁移，所以这里声明 Send 是安全的。
+unsafe impl Send for DmghgBridge {}
+
+impl DmghgBridge {
+    /// 加载并初始化。`legacy_host` 为空时用默认主机。
+    pub fn open(install_dir: &Path, legacy_host: &str) -> Result<Self, String> {
+        let legacy_host = if legacy_host.trim().is_empty() {
+            DEFAULT_LEGACY_HOST
+        } else {
+            legacy_host.trim()
+        };
+
+        // 必须在 service_new 之前：决定 legacy 家族打哪台主机。
+        std::env::set_var("DMGHG_LEGACY_DIRECT_HOST", legacy_host);
+
+        // 优先用安装目录那份（与客户端版本同步）；它内部会转发到真身。
+        // 真身单独放了一份，作为兜底。
+        let installed = install_dir.join("electron_bridge.dll");
+        let dll = if installed.is_file() {
+            installed
+        } else {
+            let real = real_dll_path().ok_or_else(|| "找不到 electron_bridge DLL".to_string())?;
+            if !real.is_file() {
+                return Err(format!("找不到 electron_bridge DLL: {}", real.display()));
+            }
+            real
+        };
+
+        let module = load_library(&dll, install_dir)?;
+
+        let service_new: ServiceNewFn =
+            unsafe { std::mem::transmute(symbol(module, "dmghg_service_new")?) };
+        let handle_command: HandleCommandFn =
+            unsafe { std::mem::transmute(symbol(module, "dmghg_service_handle_command_json")?) };
+        let string_free: StringFreeFn =
+            unsafe { std::mem::transmute(symbol(module, "dmghg_string_free")?) };
+        let service_free: ServiceFreeFn =
+            unsafe { std::mem::transmute(symbol(module, "dmghg_service_free")?) };
+
+        // 第二个参数是真身的 rdx（NULL）。config 留空表示用默认配置。
+        let config = CString::new("{}").map_err(|_| "config 含 NUL".to_string())?;
+        let service = unsafe { service_new(config.as_ptr() as *const u8, std::ptr::null_mut()) };
+        if service.is_null() {
+            return Err("dmghg_service_new 返回空指针".into());
+        }
+
+        Ok(Self {
+            service,
+            handle_command,
+            string_free,
+            service_free,
+            _module: module,
+            install_dir: install_dir.to_path_buf(),
+        })
+    }
+
+    /// 发一条命令，返回完整响应（含 `ok`）。
+    pub fn call_raw(&self, command: &str, payload: Value) -> Result<Value, String> {
+        let request = json!({
+            "request_id": format!("ttv-{}", REQUEST_SEQ.fetch_add(1, Ordering::Relaxed)),
+            "command": command,
+            "payload": payload,
+            "protocol_version": PROTOCOL_VERSION,
+        });
+        let text =
+            CString::new(request.to_string()).map_err(|_| "dmghg 请求含 NUL 字符".to_string())?;
+
+        let ptr = unsafe { (self.handle_command)(self.service, text.as_ptr() as *const u8) };
+        if ptr.is_null() {
+            return Err(format!("dmghg `{command}` 返回空指针"));
+        }
+        let response = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::os::raw::c_char) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { (self.string_free)(ptr) };
+
+        serde_json::from_str(&response)
+            .map_err(|error| format!("dmghg `{command}` 响应不是合法 JSON: {error}"))
+    }
+
+    /// 发一条命令，只取 `data`；`ok=false` 时把 error 摊平报错。
+    pub fn call(&self, command: &str, payload: Value) -> Result<Value, String> {
+        let response = self.call_raw(command, payload)?;
+        if response.get("ok").and_then(Value::as_bool) == Some(true) {
+            return Ok(response.get("data").cloned().unwrap_or(Value::Null));
+        }
+        let error = response.get("error").cloned().unwrap_or(Value::Null);
+        let code = error
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+        let detail = error
+            .get("detail")
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+        Err(format!(
+            "dmghg `{command}` 失败: {code} {message} {}",
+            truncate(&detail, 200)
+        ))
+    }
+
+    // -- 目录 -------------------------------------------------------------
+
+    /// 分类列表。返回 `(channel_id, 名称)`；带进程级缓存避免每次切类目重复跨 FFI 拉表。
+    fn channels(&self) -> Result<Vec<(i64, String)>, String> {
+        if let Ok(guard) = channels_cache().lock() {
+            if let Some((cached_at, list)) = guard.as_ref() {
+                if cached_at.elapsed() < CHANNELS_TTL && !list.is_empty() {
+                    return Ok(list.clone());
+                }
+            }
+        }
+        let data = self.call("catalog.get_channels", json!({}))?;
+        let parsed: Vec<(i64, String)> = data
+            .as_array()
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|channel| {
+                        Some((
+                            channel.get("id")?.as_i64()?,
+                            channel.get("name")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !parsed.is_empty() {
+            if let Ok(mut guard) = channels_cache().lock() {
+                *guard = Some((std::time::Instant::now(), parsed.clone()));
+            }
+        }
+        Ok(parsed)
+    }
+
+    pub fn catalog(&self, filter: &CatalogFilter) -> Result<CatalogPage, String> {
+        let page = filter.page.max(1);
+        let page_size = filter.page_size.clamp(1, 60);
+        let keyword = filter
+            .keyword
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        if let Some(keyword) = keyword {
+            let data = self.call("catalog.search_video", json!({ "key": keyword }))?;
+            let items = collect_items(&data)
+                .iter()
+                .filter_map(parse_series_item)
+                .collect::<Vec<_>>();
+            return Ok(CatalogPage {
+                total: items.len(),
+                has_more: false,
+                items,
+                page,
+                categories: vec!["全部".to_string()],
+                next_cursor: None,
+                source: "动漫共和国".into(),
+                degraded: false,
+            });
+        }
+
+        // 分类用真实频道表，名称直接来自 dmghg（日漫/国漫/剧场/美漫/特摄/少儿…）
+        let mut table: Vec<(i64, String)> = vec![(0, "全部".to_string())];
+        match self.channels() {
+            Ok(list) => table.extend(list),
+            Err(error) => {
+                // 频道表拿不到不该让整个列表挂掉：退回"全部"
+                log_line(&format!("dmghg 分类表获取失败，退回全部: {error}"));
+            }
+        }
+        // 「全部」不是 dmghg 的频道：0 只是本地标签表里的占位 id。
+        let channel_id = table
+            .iter()
+            .find(|(_, name)| name == &filter.category)
+            .map(|(id, _)| *id)
+            .filter(|id| *id > 0);
+
+        let sort = if filter.sort.trim().is_empty() {
+            "hits"
+        } else {
+            filter.sort.trim()
+        };
+
+        // ===== 「全部」：多频道聚合 =====
+        //
+        // ## 为什么必须聚合（2026-10-18 实测）
+        //
+        // 旧实现在「全部」时**不带 channel 参数**，理由是注释里写的"由服务端按
+        // 全站口径返回"。实测推翻了这个前提 —— 不带 channel 时 DLL 落到它的
+        // **默认频道（日漫）**，返回的是日漫那 12 条：
+        //
+        //   channel 缺失 / 0  → total=12   样例：五等分的新娘 / 星灵感应 …
+        //   channel=20 日漫   → total=12
+        //   channel=21 国漫   → total=26   样例：剑来 / 斩神 / 完美世界 …
+        //   channel=32 少儿   → total=871  样例：哆啦A梦 / 喜羊羊 / 熊出没 …
+        //
+        // 用户报的「全部内容推荐还是日漫、看不到其他类型」就是这一条造成的：
+        // 界面标着「全部」，数据源却只有日漫。
+        //
+        // 也没有全站命令可退（`catalog.get_home` / `get_recommend` / `get_all`
+        // 实测全部 `command_not_supported`）。所以「全部」只能由这一层把各频道
+        // 拼起来 —— 这也是唯一诚实的做法：**"全部"就是"每个频道的并集"**。
+        //
+        // 取舍：按各频道自己的热门顺序轮流取（round-robin），而不是"先把日漫
+        // 取满再取国漫"。后者会让第一页仍然是清一色日漫，等于换了个写法的同一个
+        // bug。轮流取能保证首页第一屏就出现多种类型。
+        if channel_id.is_none() {
+            let channels: Vec<i64> = table
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| *id > 0)
+                .collect();
+            if !channels.is_empty() {
+                return self.catalog_across_channels(&channels, page, page_size, sort, table);
+            }
+        }
+
+        let payload = match channel_id {
+            Some(channel) => json!({
+                "channel": channel,
+                "page": page,
+                "limit": page_size,
+                "sort": sort,
+            }),
+            None => json!({
+                "page": page,
+                "limit": page_size,
+                "sort": sort,
+            }),
+        };
+        let data = self.call("catalog.get_video_list", payload)?;
+
+        let total = data.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let items = collect_items(&data)
+            .iter()
+            .filter_map(parse_series_item)
+            .collect::<Vec<_>>();
+        let has_more = total > 0 && (page as usize) * (page_size as usize) < total;
+
+        Ok(CatalogPage {
+            total,
+            has_more,
+            items,
+            page,
+            categories: table.into_iter().map(|(_, name)| name).collect(),
+            next_cursor: has_more.then(|| (page + 1).to_string()),
+            source: "动漫共和国".into(),
+            degraded: false,
+        })
+    }
+
+    // -- 详情 -------------------------------------------------------------
+
+    /// 「全部」口径：把各频道的同一页轮流取一遍，拼成混合列表。
+    ///
+    /// ## 取法：round-robin，而不是"逐频道填满"
+    ///
+    /// 每个频道取 `ceil(page_size / 频道数)` 条（至少 2 条），然后**轮流**放进
+    /// 结果。这样第一页就同时出现日漫 / 国漫 / 少儿 / 美漫，而不是"先 30 条日漫
+    /// 再 30 条国漫"——后者虽然数据上也算"全部"，但用户第一屏看到的仍然是
+    /// 清一色日漫，和修复前没有区别。
+    ///
+    /// ## 为什么每个频道都要取第 `page` 页
+    ///
+    /// 聚合是"无状态"的：调用方翻到第 N 页，我们就把每个频道的第 N 页各取一条
+    /// 子集拼起来。这样翻页语义与单频道一致，也不需要服务端游标。
+    ///
+    /// ## 失败容忍
+    ///
+    /// 单个频道失败（网络抖动 / 该频道下架）只跳过它，不影响其余频道 ——
+    /// 这与 `anime_provider` 的多源聚合口径一致：少一个频道好过整页空。
+    fn catalog_across_channels(
+        &self,
+        channels: &[i64],
+        page: u32,
+        page_size: u32,
+        sort: &str,
+        table: Vec<(i64, String)>,
+    ) -> Result<CatalogPage, String> {
+        let page_size = page_size.max(1) as usize;
+        // 每个频道取多少条：够轮流铺满一页，又不至于把请求数放大太多。
+        // 下限 2 是让"只有两三个频道有数据"时也能凑出可见的多样性。
+        let per_channel = (page_size / channels.len().max(1)).max(2);
+
+        // 逐频道取一页。这里**串行**：DLL 内部是同一份网络栈 + 同一个 service
+        // 句柄，并发调用只会互相阻塞（实测 `get_channels` 与列表调用不能并行）。
+        // 串行代价可接受：每频道一次 IPC，实测单次 40–120ms。
+        let mut buckets: Vec<Vec<SeriesItem>> = Vec::with_capacity(channels.len());
+        let mut total = 0usize;
+        let mut any_ok = false;
+        for channel in channels {
+            let payload = json!({
+                "channel": channel,
+                "page": page,
+                "limit": per_channel,
+                "sort": sort,
+            });
+            match self.call("catalog.get_video_list", payload) {
+                Ok(data) => {
+                    any_ok = true;
+                    total += data.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let items = collect_items(&data)
+                        .iter()
+                        .filter_map(parse_series_item)
+                        .collect::<Vec<_>>();
+                    buckets.push(items);
+                }
+                Err(error) => {
+                    log_line(&format!("dmghg 聚合跳过频道 {channel}: {error}"));
+                    buckets.push(Vec::new());
+                }
+            }
+        }
+        if !any_ok {
+            return Err("dmghg 全部频道均读取失败。".to_string());
+        }
+
+        // 轮流取：第 0 轮从每个频道取第 1 条，第 1 轮取第 2 条……
+        // 用 id 去重（同一部剧可能同时挂在"日漫"和"剧场"下）。
+        let mut items: Vec<SeriesItem> = Vec::with_capacity(page_size);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut round = 0usize;
+        'outer: loop {
+            let mut took_any = false;
+            for bucket in &buckets {
+                if let Some(item) = bucket.get(round) {
+                    took_any = true;
+                    if seen.insert(item.id.clone()) {
+                        items.push(item.clone());
+                        if items.len() >= page_size {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            if !took_any {
+                break;
+            }
+            round += 1;
+            // 兜底：某个频道的 bucket 异常长时也不无限转。
+            if round > page_size * 2 {
+                break;
+            }
+        }
+
+        // has_more：任一频道还有下一页就允许继续翻。
+        let has_more = total > (page as usize) * page_size;
+
+        Ok(CatalogPage {
+            total,
+            has_more,
+            items,
+            page,
+            categories: table.into_iter().map(|(_, name)| name).collect(),
+            next_cursor: has_more.then(|| (page + 1).to_string()),
+            source: "动漫共和国".into(),
+            degraded: false,
+        })
+    }
+
+    pub fn detail(&self, series_id: &str) -> Result<SeriesDetail, String> {
+        let raw_id = strip_prefix(series_id);
+        let data = self.call("catalog.get_video_detail", json!({ "id": raw_id }))?;
+
+        let title = data
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("未命名动漫")
+            .to_string();
+        // 封面过本地代理：dmghg 封面走 `pN-ad.adukwai.com` 小站 CDN（明文 http、境外），
+        // 直连在部分网络下超时；实测还有部分条目指向百度图片代理等脏地址。
+        // 详见 `hls_proxy::proxied_image_url`。
+        let cover = data
+            .get("pic")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let cover = crate::hls_proxy::proxied_image_url(&cover).unwrap_or(cover);
+        let description = data
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        let mut tags = Vec::new();
+        if let Some(class) = data.get("type").and_then(Value::as_str) {
+            tags.extend(
+                class
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        if let Some(area) = data.get("area").and_then(Value::as_str) {
+            if !area.is_empty() {
+                tags.push(area.to_string());
+            }
+        }
+
+        let (episodes, count) = parse_episodes(&data, series_id)?;
+
+        Ok(SeriesDetail {
+            id: series_id.to_string(),
+            title,
+            cover,
+            item_type: "anime".into(),
+            tags,
+            origin: "动漫共和国".into(),
+            episodes_count: count,
+            description,
+            episodes,
+            // dmghg 的目录是完整的 MP4 列表，没有"开放到第几集"的策略信号。
+            playable_episodes: None,
+            available_qualities: vec![VideoQualityOption {
+                label: "自动".into(),
+                value: "auto".into(),
+                resolution: "由播放源自动选择".into(),
+            }],
+            sources: Vec::new(),
+        })
+    }
+
+    // -- 播放 -------------------------------------------------------------
+
+    /// 解析出该集的全部清晰度档位。
+    ///
+    /// `episode_id` 形如 `cn|第01集`。返回按分辨率从高到低排序；
+    /// 档位数取决于源的线路（实测有的作品只有 1 档，有的给 2 档）。
+    pub fn play_variants(
+        &self,
+        series_id: &str,
+        episode_id: &str,
+    ) -> Result<Vec<PlayVariant>, String> {
+        let raw_id = strip_prefix(series_id);
+        let (line, part) = episode_id
+            .split_once(EPISODE_SEP)
+            .ok_or_else(|| format!("动漫集标识非法: {episode_id}"))?;
+
+        let data = self.call(
+            "legacy.rpc",
+            json!({
+                "module": "video",
+                "type": "videoPlay",
+                "data": { "id": raw_id, "part": part, "play": line },
+            }),
+        )?;
+        let item = data
+            .as_array()
+            .and_then(|array| array.first())
+            .or(Some(&data))
+            .ok_or_else(|| "dmghg 未返回播放信息".to_string())?;
+
+        let parse_lua = item.get("parse").and_then(Value::as_str).unwrap_or("");
+        if parse_lua.trim().is_empty() {
+            return Err("dmghg 响应里没有解析脚本".into());
+        }
+        let token = item
+            .get("extension")
+            .and_then(|extension| extension.get("url"))
+            .and_then(Value::as_str)
+            .or_else(|| item.get("url").and_then(Value::as_str))
+            .ok_or_else(|| "dmghg 响应里没有播放令牌".to_string())?;
+
+        let script = self.build_parser_script(parse_lua)?;
+        let result = self.call(
+            "rule.execute_script_text",
+            json!({ "script": script, "args": [token] }),
+        )?;
+
+        let json_value = result
+            .get("result")
+            .and_then(|result| result.get("json_value"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let state = json_value
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if state != "OK" {
+            return Err(format!("dmghg 解析未成功: state={state}"));
+        }
+        let payload = json_value.get("data").and_then(Value::as_str).unwrap_or("");
+        let parsed: Value = serde_json::from_str(payload)
+            .map_err(|error| format!("dmghg 解析结果不是合法 JSON: {error}"))?;
+
+        let mut variants: Vec<PlayVariant> = parsed
+            .as_array()
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|entry| {
+                        let url = entry.get("url").and_then(Value::as_str)?;
+                        if url.trim().is_empty() {
+                            return None;
+                        }
+                        let name = entry
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        Some(PlayVariant {
+                            height: parse_variant_height(&name),
+                            name,
+                            url: url.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if variants.is_empty() {
+            return Err("dmghg 解析结果里没有播放地址".into());
+        }
+        // 源按"高→低"给，但不依赖它的顺序；同高度保持原有先后。
+        variants.sort_by_key(|variant| std::cmp::Reverse(variant.height));
+        Ok(variants)
+    }
+
+    /// 按选定清晰度取播放地址。
+    ///
+    /// `quality` 是前端传的档位字面量（形如 `1080p`）；`auto` / 空 / 认不出的值
+    /// 优先回落到 **2160p 以外的最高档**（见函数体里的 HEVC 兼容说明）。
+    pub fn resolve_play_url(
+        &self,
+        series_id: &str,
+        episode_id: &str,
+        quality: &str,
+    ) -> Result<String, String> {
+        let variants = self.play_variants(series_id, episode_id)?;
+        let wanted = parse_quality_value(quality);
+        if wanted > 0 {
+            if let Some(hit) = variants.iter().find(|variant| variant.height == wanted) {
+                return Ok(hit.url.clone());
+            }
+        }
+        // WebView2 的 HEVC 支持不可靠（PlatformHEVCDecoderSupport + 零售扩展都
+        // 就位时 153 版仍经常解不出视频轨，表现为黑屏但有声音）。实测这批源里
+        // "4K" 档是 HEVC、1080P 及以下是 H.264。所以 auto 优先选 **2160p 以外的
+        // 最高档**；4K 仅当用户显式要求时才给。
+        let best = variants
+            .iter()
+            .find(|variant| variant.height < 2160)
+            .unwrap_or(&variants[0]);
+        Ok(best.url.clone())
+    }
+
+    /// 拼出可在规则引擎里跑的脚本。
+    ///
+    /// 三处必须的前置（缺一个都拿不到真地址）：
+    /// 1. 执行沙箱里没有 `json` 全局 —— 内联 `dkjson.lua`；
+    /// 2. 脚本开头有版本白名单 —— 覆盖 `device_info`，否则返回"引导视频"；
+    /// 3. 脚本会调 UI 的 `toast` —— 给个空桩。
+    fn build_parser_script(&self, parse_lua: &str) -> Result<String, String> {
+        let dkjson_path = self
+            .install_dir
+            .join("resources")
+            .join("lua")
+            .join("dkjson.lua");
+        let dkjson = std::fs::read_to_string(&dkjson_path)
+            .map_err(|error| format!("读取 dkjson 失败 ({}): {error}", dkjson_path.display()))?;
+
+        let prelude = format!(
+            "json = (function()\n{dkjson}\nend)()\n\
+             device_info = {{ platform = \"Windows\", app_version = \"{SPOOF_APP_VERSION}\" }}\n\
+             toast = function(...) end\n"
+        );
+        Ok(format!("{prelude}{parse_lua}"))
+    }
+}
+
+impl Drop for DmghgBridge {
+    fn drop(&mut self) {
+        // 进程退出前 Tauri 会走到这里。DLL 若已被卸载则不能调，故用 catch 语义保守处理：
+        // service 与 module 都是常驻的，这里仅尽力回收。
+        if !self.service.is_null() {
+            unsafe { (self.service_free)(self.service) };
+            self.service = std::ptr::null_mut();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 进程级单例
+// ---------------------------------------------------------------------------
+
+static BRIDGE: OnceLock<Option<Mutex<DmghgBridge>>> = OnceLock::new();
+static INIT_ERROR: OnceLock<String> = OnceLock::new();
+
+/// 安装目录：优先 `TTV_DMGHG_DIR`，否则 `%LOCALAPPDATA%\Programs\动漫共和国概念版`。
+pub fn install_dir() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("TTV_DMGHG_DIR") {
+        let path = PathBuf::from(explicit.trim());
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    let base = dirs::data_local_dir()?;
+    let candidate = base.join("Programs").join("动漫共和国概念版");
+    candidate.is_dir().then_some(candidate)
+}
+
+/// 真身 DLL（安装目录那份的内部转发目标，作为兜底）。
+fn real_dll_path() -> Option<PathBuf> {
+    Some(
+        dirs::data_local_dir()?
+            .join("dmghg-electron-bridge-vipfix")
+            .join("electron_bridge.real.dll"),
+    )
+}
+
+fn legacy_host() -> String {
+    std::env::var("TTV_DMGHG_HOST").unwrap_or_else(|_| DEFAULT_LEGACY_HOST.to_string())
+}
+
+/// 源开关：`auto`（默认，桥接可用就用 dmghg）/ `dmghg`（强制）/ `bfzy`（关掉）。
+fn source_mode() -> String {
+    std::env::var("TTV_ANIME_SOURCE")
+        .unwrap_or_else(|_| "auto".to_string())
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// dmghg 是否应当作为动漫源。
+pub fn preferred() -> bool {
+    !matches!(source_mode().as_str(), "bfzy" | "fallback" | "off")
+}
+
+/// 懒加载单例。首次调用时尝试加载 DLL，失败返回 None 并记下原因。
+pub fn shared() -> Option<&'static Mutex<DmghgBridge>> {
+    if !cfg!(all(windows, target_arch = "x86_64")) {
+        let _ = INIT_ERROR.set("dmghg 桥接仅支持 Windows x64".into());
+        return None;
+    }
+    BRIDGE
+        .get_or_init(|| {
+            let Some(dir) = install_dir() else {
+                let _ = INIT_ERROR.set("未找到动漫共和国安装目录".into());
+                return None;
+            };
+            match DmghgBridge::open(&dir, &legacy_host()) {
+                Ok(bridge) => {
+                    log_line(&format!("dmghg 桥接就绪: {}", dir.display()));
+                    Some(Mutex::new(bridge))
+                }
+                Err(error) => {
+                    log_line(&format!("dmghg 桥接不可用: {error}"));
+                    let _ = INIT_ERROR.set(error);
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// 桥接是否可用（会触发一次加载尝试）。
+pub fn available() -> bool {
+    shared().is_some()
+}
+
+/// 初始化失败原因（诊断用）。
+pub fn init_error() -> Option<&'static str> {
+    shared();
+    INIT_ERROR.get().map(String::as_str)
+}
+
+fn lock(bridge: &'static Mutex<DmghgBridge>) -> MutexGuard<'static, DmghgBridge> {
+    // 调用方 panic 会污染锁，但 DLL 句柄本身仍然有效，直接取回内部值继续用。
+    bridge
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 动漫链路的日志出口。
+///
+/// 之前这里是 `println!` —— 在 `#![windows_subsystem = "windows"]` 的进程里
+/// stdout 根本没有控制台，输出直接进黑洞。于是「动漫为什么退回暴风源」这类问题
+/// 在用户机器上永远查不到（只有开发时用 cargo run 才看得见）。
+/// 改走 crate::trace::log：与控制台无关，落进应用自己的 ttv-playback.log。
+fn log_line(message: &str) {
+    crate::trace::log(format!("[anime] {message}"));
+}
+
+// ---------------------------------------------------------------------------
+// 供 anime_provider 调用的 async 门面
+//
+// DLL 调用是阻塞的，全部丢到 spawn_blocking，别占着 async 执行器。
+// ---------------------------------------------------------------------------
+
+async fn run_blocking<T, F>(job: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(job)
+        .await
+        .map_err(|error| format!("dmghg 任务执行失败: {error}"))?
+}
+
+/// 动漫目录的**类目→页**内存缓存。
+///
+/// 为什么必须加：切换类目（日漫 / 国漫 / …）走的是 `dmghg_bridge::catalog_async`
+/// → `catalog.get_video_list` 的**同步 FFI 调用**，每次都要跨进客户端进程取一遍；
+/// 而它完全没有缓存 —— 同一个类目来回切两次，第二次照样重新拉。用户报告的
+/// 「切换类目不能秒加载、会卡顿一下才刷新出来」就是这一段等待。
+///
+/// 与 guo 19 源那套「缓存优先 + SWR」保持一致：TTL 内直接回内存，过期后仍然
+/// **立即回旧值**并后台刷新（前台永远不为刷新等待）。红果与动漫原先都是每次走
+/// 网络，这条是给动漫补上的那一层。
+type ChannelsCacheEntry = (std::time::Instant, Vec<(i64, String)>);
+
+fn channels_cache() -> &'static Mutex<Option<ChannelsCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<ChannelsCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+const CHANNELS_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+fn catalog_cache() -> &'static Mutex<std::collections::HashMap<String, CachedCatalogPage>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, CachedCatalogPage>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn refreshing_catalog_keys() -> &'static Mutex<std::collections::HashSet<String>> {
+    static REFRESHING: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    REFRESHING.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// 缓存条目。`at` 用于 TTL 判定，`page` 是已解析好的结果（克隆即可返回）。
+struct CachedCatalogPage {
+    at: std::time::Instant,
+    page: CatalogPage,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DiskCatalogEntry {
+    saved_at_secs: u64,
+    page: CatalogPage,
+}
+
+/// 目录缓存存活时长。与 guo 源的目录 TTL 取同一个量级：动漫榜单在几分钟内
+/// 不会变，而用户在一个类目下连续翻页/来回切换是秒级行为。
+const CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const CATALOG_DISK_STALE_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn catalog_cache_hash(key: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn disk_cache_dir() -> Option<PathBuf> {
+    crate::app_storage_root()
+        .or_else(|| dirs::data_local_dir().map(|base| base.join("com.ttv.shortdrama")))
+        .map(|root| root.join("dmghg-catalog-cache-v1"))
+}
+
+fn should_persist_catalog(filter: &CatalogFilter) -> bool {
+    filter
+        .keyword
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+        && filter.page.max(1) <= 3
+}
+
+fn disk_cache_path(filter: &CatalogFilter) -> Option<PathBuf> {
+    if !should_persist_catalog(filter) {
+        return None;
+    }
+    let key = catalog_cache_key(filter);
+    Some(disk_cache_dir()?.join(format!("{:016x}.json", catalog_cache_hash(&key))))
+}
+
+fn read_disk_catalog_cache(filter: &CatalogFilter) -> Option<(CatalogPage, bool)> {
+    let path = disk_cache_path(filter)?;
+    let bytes = std::fs::read(&path).ok()?;
+    let entry: DiskCatalogEntry = serde_json::from_slice(&bytes).ok()?;
+    if entry.page.items.is_empty() {
+        return None;
+    }
+    let age_secs = now_epoch_secs().saturating_sub(entry.saved_at_secs);
+    if age_secs >= CATALOG_DISK_STALE_TTL.as_secs() {
+        return None;
+    }
+    let fresh = age_secs < CATALOG_TTL.as_secs();
+    Some((entry.page, fresh))
+}
+
+fn write_disk_catalog_cache(filter: &CatalogFilter, page: &CatalogPage) {
+    if page.items.is_empty() {
+        return;
+    }
+    let Some(path) = disk_cache_path(filter) else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let entry = DiskCatalogEntry {
+        saved_at_secs: now_epoch_secs(),
+        page: page.clone(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&entry) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// 缓存键：类别 / 分类 / 受众 / 排序 / 关键词 / 页。
+///
+/// **必须把全部筛选维度都编进去**：漏掉任意一个都会让"切类目回到上一个类目的
+/// 数据"——那是比慢更糟的错。受众与排序虽然动漫侧目前不参与请求，仍编入键，
+/// 免得将来后端开始用它时这里静默串味。
+fn catalog_cache_key(filter: &CatalogFilter) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        filter.channel,
+        filter.category,
+        filter.audience,
+        filter.sort,
+        filter.keyword.as_deref().unwrap_or("").trim(),
+        filter.page.max(1),
+    )
+}
+
+/// 读缓存。命中时同时返回"是否新鲜"，调用方据此决定要不要后台刷新。
+fn peek_catalog_cache(filter: &CatalogFilter) -> Option<(CatalogPage, bool)> {
+    let key = catalog_cache_key(filter);
+    let guard = catalog_cache().lock().ok()?;
+    let entry = guard.get(&key)?;
+    Some((entry.page.clone(), entry.at.elapsed() < CATALOG_TTL))
+}
+
+/// 写缓存。只在成功时调用。
+fn store_catalog_cache(filter: &CatalogFilter, page: &CatalogPage) {
+    store_catalog_cache_with_fresh(filter, page, true);
+}
+
+fn store_catalog_cache_with_fresh(filter: &CatalogFilter, page: &CatalogPage, fresh: bool) {
+    let key = catalog_cache_key(filter);
+    let at = if fresh {
+        std::time::Instant::now()
+    } else {
+        std::time::Instant::now()
+            .checked_sub(CATALOG_TTL)
+            .unwrap_or_else(std::time::Instant::now)
+    };
+    if let Ok(mut guard) = catalog_cache().lock() {
+        guard.retain(|_, v| v.at.elapsed() < CATALOG_TTL);
+        if guard.len() >= 64 {
+            guard.clear();
+        }
+        guard.insert(
+            key,
+            CachedCatalogPage {
+                at,
+                page: page.clone(),
+            },
+        );
+    }
+}
+
+fn spawn_background_refresh(filter: CatalogFilter) {
+    let key = catalog_cache_key(&filter);
+    let inserted = refreshing_catalog_keys()
+        .lock()
+        .map(|mut guard| guard.insert(key.clone()))
+        .unwrap_or(false);
+    if !inserted {
+        return;
+    }
+    tokio::task::spawn(async move {
+        let refresh_filter = filter.clone();
+        let refreshed = run_blocking(move || {
+            let bridge = shared().ok_or_else(|| "dmghg 桥接未就绪".to_string())?;
+            let page = lock(bridge).catalog(&refresh_filter)?;
+            store_catalog_cache(&refresh_filter, &page);
+            write_disk_catalog_cache(&refresh_filter, &page);
+            Ok::<(), String>(())
+        })
+        .await;
+        if let Ok(mut guard) = refreshing_catalog_keys().lock() {
+            guard.remove(&key);
+        }
+        if let Err(error) = refreshed {
+            crate::trace::log(format!("[anime] 目录后台刷新失败（沿用旧值）: {error}"));
+        }
+    });
+}
+
+/// 清空目录缓存（设置页清缓存、切换来源时调用）。
+pub fn clear_catalog_cache() {
+    if let Ok(mut guard) = catalog_cache().lock() {
+        guard.clear();
+    }
+    if let Ok(mut guard) = channels_cache().lock() {
+        *guard = None;
+    }
+    if let Some(dir) = disk_cache_dir() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+pub async fn catalog_async(filter: CatalogFilter) -> Result<CatalogPage, String> {
+    // 1) 内存命中：新鲜直接返回；过期先交出旧值并单飞后台刷新。
+    if let Some((page, fresh)) = peek_catalog_cache(&filter) {
+        if fresh {
+            return Ok(page);
+        }
+        spawn_background_refresh(filter);
+        return Ok(page);
+    }
+    // 2) 冷启动磁盘 SWR 命中：首次进动漫专区直接 0 网络瞬间出图。
+    if let Some((page, fresh)) = read_disk_catalog_cache(&filter) {
+        store_catalog_cache_with_fresh(&filter, &page, fresh);
+        if !fresh {
+            spawn_background_refresh(filter);
+        }
+        return Ok(page);
+    }
+    // 3) 未命中：走真实链路；拿锁后再复查内存缓存避免预热与前台点击重复打 DLL。
+    let result = run_blocking({
+        let filter = filter.clone();
+        move || {
+            let bridge = shared().ok_or_else(|| "dmghg 桥接未就绪".to_string())?;
+            let guard = lock(bridge);
+            if let Some((page, true)) = peek_catalog_cache(&filter) {
+                return Ok(page);
+            }
+            guard.catalog(&filter)
+        }
+    })
+    .await?;
+    store_catalog_cache(&filter, &result);
+    write_disk_catalog_cache(&filter, &result);
+    Ok(result)
+}
+
+/// 启动空闲期后台预热动漫专区首屏（「全部」第 1 页），保证未读过盘的新装用户也能秒进。
+pub async fn prewarm_default_catalog() {
+    if !preferred() {
+        return;
+    }
+    let ready = run_blocking(|| Ok(available())).await.unwrap_or(false);
+    if !ready {
+        return;
+    }
+    let filter = CatalogFilter {
+        channel: "anime".to_string(),
+        source: None,
+        category: "全部".to_string(),
+        audience: "全部".to_string(),
+        sort: "recommend".to_string(),
+        keyword: None,
+        page: 1,
+        page_size: 30,
+        cursor: None,
+    };
+    if peek_catalog_cache(&filter).is_some_and(|(_, fresh)| fresh) {
+        return;
+    }
+    let _ = catalog_async(filter).await;
+}
+
+pub async fn detail_async(series_id: String) -> Result<SeriesDetail, String> {
+    run_blocking(move || {
+        let bridge = shared().ok_or_else(|| "dmghg 桥接未就绪".to_string())?;
+        lock(bridge).detail(&series_id)
+    })
+    .await
+}
+
+pub async fn resolve_play_url_async(
+    series_id: String,
+    episode_id: String,
+    quality: String,
+) -> Result<String, String> {
+    run_blocking(move || {
+        let bridge = shared().ok_or_else(|| "dmghg 桥接未就绪".to_string())?;
+        lock(bridge).resolve_play_url(&series_id, &episode_id, &quality)
+    })
+    .await
+}
+
+/// 探测某集的全部清晰度档位（供播放页的画质菜单用）。
+pub async fn qualities_async(
+    series_id: String,
+    episode_id: String,
+) -> Result<Vec<VideoQualityOption>, String> {
+    run_blocking(move || {
+        let bridge = shared().ok_or_else(|| "dmghg 桥接未就绪".to_string())?;
+        let variants = lock(bridge).play_variants(&series_id, &episode_id)?;
+        Ok(variants_to_options(&variants))
+    })
+    .await
+}
+
+/// 把源给的档位映射成前端认的选项。
+///
+/// `value` 必须是 `{digits}p` 形式（与既有短剧链路一致，见 usePlaybackStore 的
+/// setQuality 守卫：value 不匹配就等于点不动）。
+pub fn variants_to_options(variants: &[PlayVariant]) -> Vec<VideoQualityOption> {
+    variants
+        .iter()
+        .map(|variant| {
+            let label = if variant.name.is_empty() {
+                if variant.height > 0 {
+                    format!("{}P", variant.height)
+                } else {
+                    "自动".to_string()
+                }
+            } else {
+                variant.name.clone()
+            };
+            let value = if variant.height > 0 {
+                format!("{}p", variant.height)
+            } else {
+                "auto".to_string()
+            };
+            VideoQualityOption {
+                label,
+                value,
+                resolution: variant.name.clone(),
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// 解析辅助
+// ---------------------------------------------------------------------------
+
+fn strip_prefix(series_id: &str) -> &str {
+    series_id.strip_prefix(ID_PREFIX).unwrap_or(series_id)
+}
+
+/// 从源给的档位名解析高度。
+///
+/// 实测源只给中文名，且 `width`/`height` 字段恒为 0：
+/// `"4K 超清"` / `"1080P 高清"` / `"720P"` / `"480P 流畅"`。
+/// 认不出时返回 0（调用方回落成 `auto`，不会伪造档位）。
+fn parse_variant_height(name: &str) -> u32 {
+    let lower = name.to_ascii_lowercase();
+    // K 档：4k / 2k / 8k
+    for (token, height) in [("8k", 4320u32), ("4k", 2160), ("2k", 1440)] {
+        if lower.contains(token) {
+            return height;
+        }
+    }
+    // P 档：取紧邻 p 的数字（"1080p 高清" -> 1080）
+    let bytes = lower.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'p' {
+            let mut start = index;
+            while start > 0 && bytes[start - 1].is_ascii_digit() {
+                start -= 1;
+            }
+            if start < index {
+                if let Ok(value) = lower[start..index].parse::<u32>() {
+                    if value >= 144 {
+                        return value;
+                    }
+                }
+            }
+        }
+        index += 1;
+    }
+    0
+}
+
+/// 解析前端传的档位字面量（`1080p` / `1080P` / `720`）为高度。
+/// `auto` / 空 / 认不出返回 0，表示"由源决定"。
+fn parse_quality_value(quality: &str) -> u32 {
+    let trimmed = quality.trim().trim_end_matches(['p', 'P']);
+    if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return 0;
+    }
+    trimmed.parse::<u32>().unwrap_or(0)
+}
+
+fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    text.chars().take(limit).collect::<String>() + "…"
+}
+
+/// 列表类响应既可能是 `{items:[...]}`，也可能是裸数组。
+fn collect_items(data: &Value) -> Vec<Value> {
+    if let Some(array) = data.as_array() {
+        return array.clone();
+    }
+    data.get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn parse_series_item(item: &Value) -> Option<SeriesItem> {
+    let id = item.get("id").and_then(Value::as_i64)?;
+    let title = item.get("name").and_then(Value::as_str)?.to_string();
+    // 同 detail：封面走本地代理，境外图床直连会超时。
+    let cover = item
+        .get("pic")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // 诊断：目录卡封面全空时，需要立刻区分「源没给 pic」与「字段名不是 pic」——
+    // 两者在 UI 上都只是剧名首字，光看界面永远分不出来。只打第一条，避免刷屏。
+    if cover.is_empty() {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let keys = item
+                .as_object()
+                .map(|object| object.keys().cloned().collect::<Vec<_>>().join(","))
+                .unwrap_or_default();
+            let pic_like = item
+                .as_object()
+                .map(|object| {
+                    object
+                        .iter()
+                        .filter(|(key, _)| {
+                            let lower = key.to_ascii_lowercase();
+                            lower.contains("pic")
+                                || lower.contains("cover")
+                                || lower.contains("img")
+                        })
+                        .map(|(key, value)| {
+                            format!(
+                                "{key}={}",
+                                value.to_string().chars().take(60).collect::<String>()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
+                .unwrap_or_default();
+            crate::trace::log(format!(
+                "[anime] 目录条目缺封面 标题={title} 字段={keys} 疑似封面字段={pic_like}"
+            ));
+        }
+    }
+    let cover = crate::hls_proxy::proxied_image_url(&cover).unwrap_or(cover);
+    // continu 形如 "158|周日18:40更"：竖线前是已更新集数。
+    let continu = item.get("continu").and_then(Value::as_str).unwrap_or("");
+    let episodes_count = continu
+        .split('|')
+        .next()
+        .and_then(|head| head.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+
+    let mut tags: Vec<String> = Vec::new();
+    if let Some(class) = item.get("type").and_then(Value::as_str) {
+        tags.extend(
+            class
+                .split(',')
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if let Some(area) = item.get("area").and_then(Value::as_str) {
+        if !area.is_empty() {
+            tags.push(area.to_string());
+        }
+    }
+
+    Some(SeriesItem {
+        id: format!("{ID_PREFIX}{id}"),
+        title,
+        cover,
+        item_type: "anime".into(),
+        episodes_count,
+        latest_episode_title: (!continu.is_empty()).then(|| continu.to_string()),
+        tags,
+        origin: "动漫共和国".into(),
+        brief: (!continu.is_empty()).then(|| continu.to_string()),
+        // 站方不给评分：填 0 会被前端渲染成"0.0 分"角标（SeriesCard 的
+        // `{series.rating && …}` 对 Some(0.0) 为真），那是凭空造分。
+        rating: None,
+    })
+}
+
+/// parts 结构：`[{oid, part: ["第01集", ...], play: "cn", play_zh: "国语"}]`。
+///
+/// 集 id 用 `线路|集名` 编码，因为取播放地址时 `play` 和 `part` 都要传。
+fn parse_episodes(data: &Value, series_id: &str) -> Result<(Vec<EpisodeItem>, u32), String> {
+    let groups = data
+        .get("parts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let multi_line = groups.len() > 1;
+
+    let mut episodes = Vec::new();
+    for group in &groups {
+        let line = group.get("play").and_then(Value::as_str).unwrap_or("cn");
+        let line_label = group.get("play_zh").and_then(Value::as_str).unwrap_or("");
+        let names = group
+            .get("part")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        for (index, name) in names.iter().enumerate() {
+            let Some(name) = name.as_str() else { continue };
+            let title = if multi_line && !line_label.is_empty() {
+                format!("{name}·{line_label}")
+            } else {
+                name.to_string()
+            };
+            episodes.push(EpisodeItem {
+                id: format!("{line}{EPISODE_SEP}{name}"),
+                series_id: series_id.to_string(),
+                episode_number: (index + 1) as u32,
+                title,
+                duration_seconds: 0.0,
+                preview_url: None,
+            });
+        }
+    }
+
+    if episodes.is_empty() {
+        return Err("dmghg 详情没有可播放的选集。".into());
+    }
+    let count = episodes.len() as u32;
+    Ok((episodes, count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn episode_id_encodes_line_and_part() {
+        let detail = json!({
+            "name": "仙逆",
+            "pic": "http://example/x.png",
+            "content": "简介",
+            "type": "玄幻,战斗",
+            "area": "大陆",
+            "parts": [{ "oid": 2, "part": ["第01集", "第02集"], "play": "cn", "play_zh": "国语" }],
+        });
+        let (episodes, count) = parse_episodes(&detail, "dmghg:181655").expect("应解析出选集");
+        assert_eq!(count, 2);
+        assert_eq!(episodes[0].id, "cn|第01集");
+        assert_eq!(episodes[0].episode_number, 1);
+        // 单线路时不加线路后缀
+        assert_eq!(episodes[0].title, "第01集");
+    }
+
+    #[test]
+    fn multi_line_episodes_get_line_suffix() {
+        let detail = json!({
+            "parts": [
+                { "part": ["第01集"], "play": "cn", "play_zh": "国语" },
+                { "part": ["第01集"], "play": "jp", "play_zh": "日语" },
+            ],
+        });
+        let (episodes, _) = parse_episodes(&detail, "dmghg:1").expect("应解析出选集");
+        assert_eq!(episodes.len(), 2);
+        assert_eq!(episodes[0].title, "第01集·国语");
+        assert_eq!(episodes[1].title, "第01集·日语");
+        assert_eq!(episodes[1].id, "jp|第01集");
+    }
+
+    #[test]
+    fn empty_parts_is_an_error() {
+        assert!(parse_episodes(&json!({ "parts": [] }), "dmghg:1").is_err());
+    }
+
+    #[test]
+    fn series_item_uses_continu_head_for_episode_count() {
+        let item = json!({
+            "id": 181655, "name": "仙逆", "pic": "http://x/y.png",
+            "continu": "158|周日18:40更", "type": "玄幻,战斗", "area": "大陆",
+        });
+        let series = parse_series_item(&item).expect("应解析出剧集");
+        assert_eq!(series.id, "dmghg:181655");
+        assert_eq!(series.episodes_count, 158);
+        assert_eq!(series.tags, vec!["玄幻", "战斗", "大陆"]);
+        assert_eq!(
+            series.latest_episode_title.as_deref(),
+            Some("158|周日18:40更")
+        );
+    }
+
+    #[test]
+    fn series_item_without_continu_reports_zero() {
+        let item = json!({ "id": 1, "name": "x" });
+        let series = parse_series_item(&item).expect("应解析出剧集");
+        assert_eq!(series.episodes_count, 0);
+        assert!(series.latest_episode_title.is_none());
+    }
+
+    #[test]
+    fn collect_items_accepts_both_shapes() {
+        assert_eq!(collect_items(&json!([{"id": 1}])).len(), 1);
+        assert_eq!(collect_items(&json!({"items": [{"id": 1}]})).len(), 1);
+        assert!(collect_items(&json!({"total": 0})).is_empty());
+    }
+
+    #[test]
+    fn strip_prefix_tolerates_bare_ids() {
+        assert_eq!(strip_prefix("dmghg:181655"), "181655");
+        assert_eq!(strip_prefix("158973"), "158973");
+    }
+
+    /// 真机冒烟测试：完整链路（加载 DLL → 列表 → 详情 → 解析播放地址）。
+    ///
+    /// 需要本机装有动漫共和国客户端，所以默认跳过。
+    /// 跑法：`cargo test -- --ignored --nocapture dmghg_smoke`
+    #[test]
+    #[ignore = "需要本机安装动漫共和国客户端"]
+    fn dmghg_smoke_end_to_end() {
+        let bridge = shared().expect("dmghg 桥接应可用（需要本机安装客户端）");
+        let guard = lock(bridge);
+
+        let filter = CatalogFilter {
+            source: None,
+            channel: "anime".into(),
+            category: "全部".into(),
+            audience: String::new(),
+            sort: "hits".into(),
+            keyword: None,
+            page: 1,
+            page_size: 5,
+            cursor: None,
+        };
+        let page = guard.catalog(&filter).expect("列表应成功");
+        println!(
+            "[冒烟] 列表 total={} items={}",
+            page.total,
+            page.items.len()
+        );
+        assert!(!page.items.is_empty(), "列表不应为空");
+
+        let first = &page.items[0];
+        assert!(first.id.starts_with(ID_PREFIX), "id 应带 dmghg 前缀");
+        println!("[冒烟] 首条 {} ({})", first.title, first.id);
+
+        let detail = guard.detail(&first.id).expect("详情应成功");
+        println!(
+            "[冒烟] 详情 {} 共 {} 集",
+            detail.title, detail.episodes_count
+        );
+        assert!(!detail.episodes.is_empty(), "选集不应为空");
+
+        let episode = &detail.episodes[0];
+
+        // 档位探测：有的作品 1 档，有的 2 档（实测凡人修仙传给 4K + 1080P）。
+        let variants = guard
+            .play_variants(&first.id, &episode.id)
+            .expect("档位解析应成功");
+        println!("[冒烟] 档位 {} 个:", variants.len());
+        for variant in &variants {
+            println!(
+                "[冒烟]   {} (height={}) -> {}",
+                variant.name, variant.height, variant.url
+            );
+        }
+        assert!(!variants.is_empty(), "至少应有一档");
+        // 高度按降序（最高档在前）
+        for pair in variants.windows(2) {
+            assert!(pair[0].height >= pair[1].height, "档位应按高度降序");
+        }
+
+        // 指定档位能取到对应地址；认不出的档位回落最高档。
+        let top = &variants[0];
+        let by_quality = guard
+            .resolve_play_url(&first.id, &episode.id, &format!("{}p", top.height))
+            .expect("按档位取地址应成功");
+        assert_eq!(by_quality, top.url, "指定档位应命中同一档");
+        let auto = guard
+            .resolve_play_url(&first.id, &episode.id, "auto")
+            .expect("auto 应成功");
+        assert_eq!(auto, top.url, "auto 应回落最高档");
+        println!("[冒烟] {} => {auto}", episode.title);
+        assert!(auto.starts_with("http"), "播放地址应是 http(s)");
+
+        // 选项映射：value 必须是前端守卫认的 `{digits}p` 形式。
+        let options = variants_to_options(&variants);
+        for option in &options {
+            if option.value != "auto" {
+                let digits = option.value.trim_end_matches('p');
+                assert!(
+                    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()),
+                    "档位 value 必须形如 `1080p`，实际 {}",
+                    option.value
+                );
+            }
+        }
+        println!(
+            "[冒烟] 选项: {:?}",
+            options.iter().map(|o| &o.value).collect::<Vec<_>>()
+        );
+    }
+
+    /// 动漫目录缓存的**实机计时**冒烟：同一类目连查两次，第二次必须几乎瞬时。
+    ///
+    /// 需要本机安装动漫共和国客户端，所以与上面的冒烟一样默认跳过。
+    /// 跑法：`cargo test -- --ignored --nocapture dmghg_catalog_cache`
+    ///
+    /// 这条测的是用户报的那个现象本身——「切换类目不能秒加载，会卡顿一下才刷新
+    /// 出来」。断言用**比值**而不是绝对毫秒：这台机器上 dmghg 的 FFI 往返实测
+    /// 数百毫秒到一秒多，而缓存命中应当是微秒级，两者差三四个数量级，任何一个
+    /// 像样的机器上都判得出来；写死毫秒反而会在慢机器上误报。
+    #[test]
+    #[ignore = "需要本机安装动漫共和国客户端"]
+    fn dmghg_catalog_cache_makes_repeat_lookup_instant() {
+        // 先清一次，保证下面的第一次一定是冷查（不依赖上一次运行的状态）。
+        clear_catalog_cache();
+
+        let filter = CatalogFilter {
+            source: None,
+            channel: "anime".into(),
+            category: "全部".into(),
+            audience: String::new(),
+            sort: "hits".into(),
+            keyword: None,
+            page: 1,
+            page_size: 20,
+            cursor: None,
+        };
+
+        // 冷查：走真实 FFI。
+        let cold_started = std::time::Instant::now();
+        let cold = tauri::async_runtime::block_on(catalog_async(filter.clone()))
+            .expect("冷查应当成功（需要本机装动漫共和国客户端）");
+        let cold_ms = cold_started.elapsed().as_millis();
+        println!(
+            "[缓存冒烟] 全部冷查 {}ms items={} 分类={:?}",
+            cold_ms,
+            cold.items.len(),
+            cold.categories
+        );
+        assert!(!cold.items.is_empty(), "列表不应为空");
+
+        // 「全部」必须真的返回全站口径，而不是落到 dmghg 的默认频道（日漫）。
+        // 这是用户报的那个现象本身：切到「全部」仍只看到日漫。
+        let mut japanese = filter.clone();
+        japanese.category = "日漫".into();
+        let jp = tauri::async_runtime::block_on(catalog_async(japanese)).expect("日漫冷查应当成功");
+        println!("[缓存冒烟] 日漫冷查 items={}", jp.items.len());
+        assert!(
+            cold.total > jp.total,
+            "「全部」的 total 必须大于单频道「日漫」（全部={} / 日漫={}）",
+            cold.total,
+            jp.total
+        );
+
+        // 热查：必须命中缓存。
+        let warm_started = std::time::Instant::now();
+        let warm =
+            tauri::async_runtime::block_on(catalog_async(filter.clone())).expect("热查应当成功");
+        let warm_us = warm_started.elapsed().as_micros();
+        println!("[缓存冒烟] 热查 {}us items={}", warm_us, warm.items.len());
+
+        assert_eq!(
+            warm.items.len(),
+            cold.items.len(),
+            "缓存命中必须返回与冷查一致的结果"
+        );
+        assert_eq!(warm.total, cold.total, "total 也必须一致");
+        assert_eq!(warm.categories, cold.categories, "分类表也必须一致");
+        // 命中缓存时不做任何 FFI，应当在毫秒级；给一个宽松上限避免慢机器误报。
+        assert!(
+            warm_us < 50_000,
+            "缓存命中应远快于冷查（实测热查 {warm_us}us / 冷查 {cold_ms}ms）"
+        );
+
+        // 换一个类目必须**不命中**：漏掉筛选维度就会串味，这条挡住那个错误。
+        let mut other = filter.clone();
+        other.category = "日韩动漫".into();
+        assert!(
+            peek_catalog_cache(&other).is_none(),
+            "换类目不应命中上一个类目的缓存"
+        );
+
+        clear_catalog_cache();
+    }
+
+    /// 诊断用：打印 dmghg 详情里的**全部图片类字段**，确认封面是不是只有 `pic` 一个来源。
+    ///
+    /// 起因：个别条目的 `pic` 指向与源站无关的第三方图床（实测
+    /// `spore-mall.cdn.bcebos.com/...` 返回 404、`p3-aio.ecombdimg.com/...` 是电商 CDN），
+    /// 需要在“源站脏数据”这个前提下确认还有没有别的字段可以兑封面。
+    /// 默认忽略（需要本机客户端 + 联网）。
+    /// 跑法：`cargo test --bins -- --ignored --nocapture dmghg_dump_raw_detail`
+    #[test]
+    #[ignore = "诊断用：需要本机安装动漫共和国客户端"]
+    fn dmghg_dump_raw_detail() {
+        let bridge = shared().expect("dmghg 桥接应可用（需要本机安装客户端）");
+        let guard = lock(bridge);
+        // 184574 / 194837 是实测封面为第三方脏图床的两条，181412 作为正常样本对照。
+        for id in [184574_i64, 194837, 181412] {
+            // 源要求 id 是**字符串**：传整数会报 `invalid type: integer ... expected a string`。
+            match guard.call("catalog.get_video_detail", json!({ "id": id.to_string() })) {
+                Ok(data) => {
+                    println!("=== id={id} ===");
+                    let Some(object) = data.as_object() else {
+                        println!("  非对象响应");
+                        continue;
+                    };
+                    println!("  字段名: {:?}", object.keys().collect::<Vec<_>>());
+                    for (key, value) in object {
+                        let lower = key.to_ascii_lowercase();
+                        if lower.contains("pic")
+                            || lower.contains("img")
+                            || lower.contains("cover")
+                            || lower.contains("image")
+                        {
+                            println!("  {key} = {value}");
+                        }
+                    }
+                }
+                Err(error) => println!("=== id={id} === 失败: {error}"),
+            }
+        }
+    }
+    #[test]
+    fn variant_height_parses_chinese_labels() {
+        // 源实际给的就是这些
+        assert_eq!(parse_variant_height("4K 超清"), 2160);
+        assert_eq!(parse_variant_height("1080P 高清"), 1080);
+        assert_eq!(parse_variant_height("720P"), 720);
+        assert_eq!(parse_variant_height("480P 流畅"), 480);
+        assert_eq!(parse_variant_height("1080p"), 1080);
+        assert_eq!(parse_variant_height("2K"), 1440);
+        assert_eq!(parse_variant_height("8K 极清"), 4320);
+        // 认不出就是 0，绝不猜
+        assert_eq!(parse_variant_height("默认"), 0);
+        assert_eq!(parse_variant_height(""), 0);
+        assert_eq!(parse_variant_height("高清"), 0);
+    }
+
+    #[test]
+    fn quality_value_matches_frontend_literal() {
+        assert_eq!(parse_quality_value("1080p"), 1080);
+        assert_eq!(parse_quality_value("1080P"), 1080);
+        assert_eq!(parse_quality_value("720"), 720);
+        // auto / 空 / 垃圾值 -> 0（表示由源决定）
+        assert_eq!(parse_quality_value("auto"), 0);
+        assert_eq!(parse_quality_value(""), 0);
+        assert_eq!(parse_quality_value("   "), 0);
+        assert_eq!(parse_quality_value("高清"), 0);
+    }
+
+    #[test]
+    fn variant_options_use_digits_p_values() {
+        let variants = vec![
+            PlayVariant {
+                name: "4K 超清".into(),
+                url: "http://a/1".into(),
+                height: 2160,
+            },
+            PlayVariant {
+                name: "1080P 高清".into(),
+                url: "http://a/2".into(),
+                height: 1080,
+            },
+        ];
+        let options = variants_to_options(&variants);
+        assert_eq!(options[0].value, "2160p");
+        assert_eq!(options[1].value, "1080p");
+        // label 保留源的中文名，前端会 split(' ')[0] 取首段
+        assert_eq!(options[0].label, "4K 超清");
+    }
+
+    #[test]
+    fn unparsable_variant_falls_back_to_auto() {
+        let variants = vec![PlayVariant {
+            name: "默认".into(),
+            url: "http://a/1".into(),
+            height: 0,
+        }];
+        let options = variants_to_options(&variants);
+        assert_eq!(options[0].value, "auto");
+        assert_eq!(options[0].label, "默认");
+    }
+
+    #[test]
+    fn disk_catalog_cache_roundtrips_default_page() {
+        let filter = CatalogFilter {
+            channel: "anime".into(),
+            source: None,
+            category: "全部".into(),
+            audience: "全部".into(),
+            sort: "recommend".into(),
+            keyword: None,
+            page: 1,
+            page_size: 30,
+            cursor: None,
+        };
+        let page = CatalogPage {
+            items: vec![SeriesItem {
+                id: "dmghg:1".into(),
+                title: "测试番剧".into(),
+                cover: "https://example.com/a.jpg".into(),
+                item_type: "anime".into(),
+                episodes_count: 12,
+                latest_episode_title: None,
+                tags: vec!["日漫".into()],
+                origin: "动漫共和国".into(),
+                brief: None,
+                rating: None,
+            }],
+            total: 1,
+            has_more: true,
+            page: 1,
+            categories: vec!["全部".into(), "日漫".into()],
+            next_cursor: Some("2".into()),
+            source: "动漫共和国".into(),
+            degraded: false,
+        };
+        write_disk_catalog_cache(&filter, &page);
+        let (loaded, fresh) = read_disk_catalog_cache(&filter).expect("应命中磁盘目录缓存");
+        assert!(fresh);
+        assert_eq!(loaded.items.len(), 1);
+        assert_eq!(loaded.items[0].id, "dmghg:1");
+        clear_catalog_cache();
+        assert!(read_disk_catalog_cache(&filter).is_none());
+    }
+}

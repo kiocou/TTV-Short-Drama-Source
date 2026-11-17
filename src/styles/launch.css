@@ -1,0 +1,255 @@
+/* ==========================================================================
+   TTV Short Drama · 启动进入动画（方案 05「轨道汇聚」）
+   --------------------------------------------------------------------------
+   6 张迷你海报绕品牌公转 1.1 圈（角速度由快到慢），然后依次被吸进中心；
+   品牌承接六次撞击、回弹一次，再淡出让位给主界面。总长 2150ms。
+
+   几何与时间参数全在 LaunchAnimation.tsx 里，这里只放静态样式。
+   轨道椭圆 600×392（RX 300 / RY 196），卡片 80×112 —— 卡轨比 0.27。
+   整组按窗口大小用 --launch-k 缩放（1080×720 的最小窗口下取 0.85）。
+
+   三条必须保持的约定：
+
+   1. 动画一律走 element.animate + fill:'both'，跑完 cancel()。
+      **不要**换成 CSS animation + fill:forwards —— 项目已经因为 forwards
+      把 transform/filter 永久钉在元素上（NVIDIA VSR 失效）踩过一次。
+      fill:'both' 是为了让延迟期间也停在 0% 帧（否则元素会先闪一下原样），
+      cancel() 才是真正的收尾。
+
+   2. 底衬必须原样抄 .mica-backdrop 的四个渐变。少抄/改序都会让"撤层"那一帧
+      背景跳色 —— 动画层和真实界面的底必须是同一块底。
+
+   3. z-index 一律显式给。只靠 DOM 顺序的话前后面会乱（卡片会永远从品牌上面
+      压过去，前后关系就是假的）。
+
+   命名沿用 crystal.css 的约定：结构件用 ttv- 前缀，不与其它视图冲突。
+   ========================================================================== */
+
+/* 启动动画的强调色与品牌着色。浅色主题＝品牌紫；dark.css 换成黑红的那支红，
+   让"开屏"和暗色界面是同一套颜色。导轨 / 光晕 / 冲击环 / 品牌投影全从这里取色，
+   改色只改这一处（JS 侧的品牌 filter 关键帧也读同一对变量）。
+   tint 写成 hue-rotate(0deg) 而不是留空：空的自定义属性会被压缩器丢掉，
+   于是 var() 失效、整条 filter 声明作废，品牌反而失去投影。 */
+:root {
+  --launch-accent-rgb: 109 71 230;
+  --launch-logo-tint: hue-rotate(0deg);
+
+  /* 六张迷你海报卡的底色。用渐变而不是真实封面：启动这一刻远程封面还没回来，
+     这里只需要"内容"的象征。暗色主题在 dark.css 里整组换成黑红系。 */
+  --launch-frame-1: linear-gradient(160deg, #6366f1, #a855f7);
+  --launch-frame-2: linear-gradient(160deg, #0ea5e9, #22d3ee);
+  --launch-frame-3: linear-gradient(160deg, #f43f5e, #fb923c);
+  --launch-frame-4: linear-gradient(160deg, #10b981, #84cc16);
+  --launch-frame-5: linear-gradient(160deg, #8b5cf6, #ec4899);
+  --launch-frame-6: linear-gradient(160deg, #f59e0b, #ef4444);
+}
+
+.ttv-launch {
+  position: absolute;
+  inset: 0;
+  z-index: 70;                 /* 盖住 TitleBar(z-50) 与更新弹窗(z-60) */
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  /*
+    ## 滚轮必须能穿透到下面的首页（2026-10-19 修「刚打开时滚轮没效果」）
+
+    这一层是 `position: absolute; inset: 0` 铺满全屏、z-index 70 —— 在它
+    存活的这 1.7–3.2 秒里，**所有指针与滚轮事件都被它接住**。而用户打开
+    应用的第一件事往往就是滚一下看看有什么剧，于是表现为
+    「刚打开时滚轮没反应，过一会儿又好了」——"过一会儿"正是它卸载的时刻。
+
+    置 `pointer-events: none` 之后，滚轮直接落到下面首页的
+    `overflow-y-auto` 容器上，启动动画期间也能正常滚动。
+
+    代价是"点画面任意处跳过动画"这条交互失效了。这是**有意的取舍**：
+      - 跳过还有三个入口：底部的显式提示按钮（下面单独恢复它的点击）、
+        Esc / 空格 / 回车（见 LaunchAnimation 的 keydown 监听）；
+      - 而"启动期间能不能滚首页"是打开应用时的**第一条**真实交互，
+        它比"点任意处跳过一段装饰动画"重要得多。
+
+    ⚠️ 不要给这一层加回 `pointer-events: auto`：它盖住的是**整个应用**，
+    不只是一块装饰区。
+  */
+  pointer-events: none;
+  /* 与 .mica-backdrop 共用同一个变量，见 mica.css 的 --theme-backdrop */
+  background: var(--theme-backdrop);
+}
+
+/* 跳过的淡出不用 class 管：动画层自身的 opacity 由 WAAPI 的 fill 占着，
+   类里的 opacity 会被动画的 "animation origin" 压过去。
+   实现在 LaunchAnimation.tsx 的 skip() —— 先把壳层 cancel 回终态，
+   再从那**一刻的真实不透明度**补一段新动画到 0，所以无论第几毫秒跳过都不闪回。 */
+
+/*
+  ⚠️ 这一层已经 `pointer-events: none`，所以"点任意处跳过"不再生效。
+  底部提示条要单独恢复可点，否则用户用鼠标就跳不过动画了。
+
+  注意：`opacity: 0` 只是视觉上淡出，元素仍然可点——这里靠父层的
+  `pointer-events: none` 保证它不吃掉首页的点击（提示条自身区域除外，
+  那是刻意的：它就是"跳过"按钮）。
+*/
+.ttv-launch-hint {
+  position: absolute;
+  right: 22px;
+  bottom: 16px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: #94a3b8;
+  /*
+    按钮复位：它现在是 <button>（跳过动画的唯一鼠标入口），
+    要抹掉浏览器默认的边框/底色/字体，否则会出现一块系统灰按钮。
+  */
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 6px 10px;
+  margin: 0;
+  border-radius: 8px;
+  font-family: inherit;
+  cursor: pointer;
+  /*
+    ⚠️ 必须显式 auto：父层 `.ttv-launch` 是 pointer-events: none，
+    不恢复的话这个按钮同样点不到，鼠标用户就没有跳过入口了。
+  */
+  pointer-events: auto;
+  transition: color 0.15s ease, background 0.15s ease;
+  /*
+    opacity: 0 —— 这一条的显隐由 WAAPI 在时间线里驱动（见 startIdle / buildPhaseA），
+    这里给 0 只是"尚未被动画点亮"的初值。
+    注意：opacity: 0 的元素**仍然可点**，所以它不会因为"看不见"而变成隐形热区
+    ——时间线会在合适的时候把它淡进来。
+  */
+  opacity: 0;
+}
+
+/* 悬停：给一点"这确实能点"的反馈 */
+.ttv-launch-hint:hover {
+  color: #cbd5e1;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* 键盘聚焦时要有可见轮廓：这是唯一的跳过入口，不能只有鼠标能用 */
+.ttv-launch-hint:focus-visible {
+  outline: 2px solid rgba(148, 163, 184, 0.7);
+  outline-offset: 2px;
+}
+
+/* ── 轨道组：132×132 的居中盒，子元素全部绝对定位，靠 grid 对齐居中 ── */
+.ttv-launch-orbit {
+  position: relative;
+  width: 132px;
+  height: 132px;
+  display: grid;
+  place-items: center;
+  transform: scale(var(--launch-k, 1));
+}
+
+.ttv-launch-glow {
+  position: absolute;
+  width: 480px;
+  height: 480px;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    rgb(var(--launch-accent-rgb) / 0.30),
+    rgb(var(--launch-accent-rgb) / 0.16) 46%,
+    transparent 70%
+  );
+  opacity: 0;
+  z-index: 0;
+}
+
+/* 椭圆导轨：给"公转"一个可读的轨道，收束时缩进品牌 */
+.ttv-launch-guide {
+  position: absolute;
+  width: 600px;
+  height: 392px;
+  border-radius: 50%;
+  border: 1px solid rgb(var(--launch-accent-rgb) / 0.22);
+  opacity: 0;
+  z-index: 0;
+}
+
+.ttv-launch-logo-wrap {
+  position: absolute;
+  width: 132px;
+  height: 132px;
+  display: grid;
+  place-items: center;
+  z-index: 2;                  /* 后方卡片(1) 与前方卡片(3) 之间 */
+  transform-origin: center center;
+}
+
+.ttv-launch-logo {
+  width: 118px;
+  height: 118px;
+  display: block;
+  /* 这条影子会被 JS 里的 filter 补间一起带上（LaunchAnimation 的 logoFilter）。
+     只写 blur() 的话 fill 会把影子永久顶掉，品牌从此没有投影。 */
+  filter: var(--launch-logo-tint) drop-shadow(0 10px 26px rgb(var(--launch-accent-rgb) / 0.34));
+}
+
+/* ── 迷你海报卡 ── */
+.ttv-launch-frame {
+  position: absolute;
+  width: 80px;
+  height: 112px;
+  border-radius: 11px;
+  overflow: hidden;
+  opacity: 0;
+  z-index: 1;
+  transform-origin: center center;
+  will-change: transform, opacity, filter;
+  box-shadow:
+    0 12px 30px -8px rgba(15, 23, 42, 0.36),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.58);
+}
+
+/* 底部压暗，让标题线读得出来（和真实海报卡的下缘压暗同一个做法） */
+.ttv-launch-frame::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 58%;
+  background: linear-gradient(0deg, rgba(15, 23, 42, 0.66), rgba(15, 23, 42, 0.12) 62%, transparent);
+}
+
+.ttv-launch-frame-title {
+  position: absolute;
+  left: 10px;
+  bottom: 26px;
+  width: 40px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.94);
+}
+
+.ttv-launch-frame-meta {
+  position: absolute;
+  left: 10px;
+  bottom: 15px;
+  width: 24px;
+  height: 3.5px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.52);
+}
+
+/* 最后一次撞击的冲击波 */
+.ttv-launch-ring {
+  position: absolute;
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  border: 1px solid rgb(var(--launch-accent-rgb) / 0.52);
+  opacity: 0;
+  z-index: 4;
+}
+
+/* 系统开了"减少动态效果"时组件会整个不渲染，这里只是兜底 */
+@media (prefers-reduced-motion: reduce) {
+  .ttv-launch { display: none; }
+}

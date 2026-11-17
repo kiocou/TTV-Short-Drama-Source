@@ -1,0 +1,4300 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>TTV Native Player HUD</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --font-sans: "Microsoft YaHei UI", "PingFang SC", "Segoe UI", system-ui, sans-serif;
+    --font-mono: "Cascadia Mono", "Consolas", "SFMono-Regular", monospace;
+    --radius-island: 14px;
+    --radius-panel: 16px;
+    --ease: cubic-bezier(0.22, 1, 0.36, 1);
+    --ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
+    --frame-w: 100vw;
+    --frame-h: 100vh;
+    --flyout-max-h: calc(100vh - 150px);
+  }
+
+  /* Custom Ultra-Thin Crystal Overlay Scrollbar (eliminates Win32 classic scrollbars & arrows) */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 5px;
+    height: 5px;
+  }
+  *::-webkit-scrollbar-button {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+  *::-webkit-scrollbar-track,
+  *::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 999px;
+    border: 1px solid transparent;
+    background-clip: padding-box;
+    transition: background-color 0.16s var(--ease);
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--text-sub);
+    background-clip: padding-box;
+  }
+
+  /* Monochrome Black Theme (Default Dark Obsidian Crystal) */
+  body[data-theme="dark"] {
+    color-scheme: dark;
+    --glass-bg: rgba(12, 12, 16, 0.72);
+    --glass-hover: rgba(255, 255, 255, 0.11);
+    --glass-active: rgba(255, 255, 255, 0.18);
+    --panel-bg: rgba(14, 14, 18, 0.90);
+    --card-bg: rgba(255, 255, 255, 0.048);
+    --border: rgba(255, 255, 255, 0.13);
+    --border-strong: rgba(255, 255, 255, 0.34);
+    --inner-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.15);
+    --inner-rim: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+    --text: #f8fafc;
+    --text-sub: rgba(248, 250, 252, 0.70);
+    --text-muted: rgba(248, 250, 252, 0.44);
+    --accent: #ffffff;
+    --accent-fg: #09090b;
+    --accent-soft: rgba(255, 255, 255, 0.14);
+    --accent-border: rgba(255, 255, 255, 0.46);
+    --track-bg: rgba(255, 255, 255, 0.18);
+    --buf-bg: rgba(255, 255, 255, 0.34);
+    --fill-bg: #ffffff;
+    --shadow: 0 14px 34px rgba(0, 0, 0, 0.54);
+    --tooltip-bg: rgba(12, 12, 16, 0.94);
+    --tooltip-fg: #f8fafc;
+    --tooltip-border: rgba(255, 255, 255, 0.18);
+    --modal-backdrop: rgba(0, 0, 0, 0.48);
+    --scrim-top: linear-gradient(180deg, rgba(0, 0, 0, 0.44) 0%, rgba(0, 0, 0, 0.14) 56%, rgba(0, 0, 0, 0) 100%);
+    --scrim-bottom: linear-gradient(0deg, rgba(0, 0, 0, 0.52) 0%, rgba(0, 0, 0, 0.18) 60%, rgba(0, 0, 0, 0) 100%);
+  }
+
+  /* Monochrome White Theme (Porcelain Crystal) */
+  body[data-theme="light"] {
+    color-scheme: light;
+    --glass-bg: rgba(250, 251, 253, 0.84);
+    --glass-hover: rgba(9, 9, 11, 0.075);
+    --glass-active: rgba(9, 9, 11, 0.13);
+    --panel-bg: rgba(252, 252, 254, 0.93);
+    --card-bg: rgba(9, 9, 11, 0.036);
+    --border: rgba(9, 9, 11, 0.13);
+    --border-strong: rgba(9, 9, 11, 0.34);
+    --inner-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.92);
+    --inner-rim: inset 0 0 0 1px rgba(255, 255, 255, 0.42);
+    --text: #09090b;
+    --text-sub: rgba(9, 9, 11, 0.70);
+    --text-muted: rgba(9, 9, 11, 0.46);
+    --accent: #09090b;
+    --accent-fg: #ffffff;
+    --accent-soft: rgba(9, 9, 11, 0.09);
+    --accent-border: rgba(9, 9, 11, 0.40);
+    --track-bg: rgba(9, 9, 11, 0.15);
+    --buf-bg: rgba(9, 9, 11, 0.30);
+    --fill-bg: #09090b;
+    --shadow: 0 14px 32px rgba(0, 0, 0, 0.18);
+    --tooltip-bg: rgba(252, 252, 254, 0.96);
+    --tooltip-fg: #09090b;
+    --tooltip-border: rgba(9, 9, 11, 0.16);
+    --modal-backdrop: rgba(255, 255, 255, 0.44);
+    --scrim-top: linear-gradient(180deg, rgba(0, 0, 0, 0.22) 0%, rgba(0, 0, 0, 0.06) 58%, rgba(0, 0, 0, 0) 100%);
+    --scrim-bottom: linear-gradient(0deg, rgba(0, 0, 0, 0.28) 0%, rgba(0, 0, 0, 0.08) 60%, rgba(0, 0, 0, 0) 100%);
+  }
+
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: transparent !important;
+    font-family: var(--font-sans);
+    color: var(--text);
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .player-frame {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: transparent !important;
+  }
+
+  .player-frame.cursor-hidden,
+  .player-frame.cursor-hidden * {
+    cursor: none !important;
+  }
+
+  .video-stage {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    background: transparent !important;
+  }
+
+  /* Danmaku Canvas Overlay (strictly non-interactive, sits behind menus & controls) */
+  .danmaku-layer {
+    position: absolute;
+    inset: 0;
+    z-index: 8;
+    pointer-events: none;
+    overflow: hidden;
+  }
+  .dm-item {
+    position: absolute;
+    left: 0;
+    top: 0;
+    white-space: nowrap;
+    will-change: transform;
+    line-height: 1.2;
+    pointer-events: none;
+  }
+
+  /* Subtle Ambient Edge Scrims (improve readability over bright video frames) */
+  .chrome-scrim {
+    position: absolute;
+    left: 0;
+    right: 0;
+    pointer-events: none;
+    z-index: 12;
+    opacity: 1;
+    transition: opacity 0.26s var(--ease);
+  }
+  .chrome-scrim-top {
+    top: 0;
+    height: 88px;
+    background: var(--scrim-top);
+  }
+  .chrome-scrim-bottom {
+    bottom: 0;
+    height: 112px;
+    background: var(--scrim-bottom);
+  }
+  .player-frame.is-idle .chrome-scrim,
+  .player-frame.is-locked .chrome-scrim {
+    opacity: 0;
+  }
+
+  /* Loading / Buffering Capsule */
+  .loading-pill {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%) scale(0.95);
+    z-index: 16;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 16px;
+    border-radius: 999px;
+    background: var(--glass-bg);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(22px) saturate(135%);
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 500;
+    box-shadow: var(--inner-highlight), var(--inner-rim), var(--shadow);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s var(--ease), transform 0.2s var(--ease);
+  }
+  .loading-pill.show {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  .spinner {
+    width: 15px;
+    height: 15px;
+    border-radius: 50%;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    animation: spin 0.75s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* HUD Technical Telemetry Card (I key) */
+  .osd-card {
+    position: absolute;
+    top: 66px;
+    left: 16px;
+    z-index: 18;
+    min-width: 244px;
+    padding: 12px 14px;
+    border-radius: 12px;
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(24px);
+    box-shadow: var(--inner-highlight), var(--inner-rim), var(--shadow);
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11.5px;
+    line-height: 1.65;
+    color: var(--text-sub);
+    pointer-events: none;
+    opacity: 0;
+    transform: translateY(-6px);
+    transition: opacity 0.18s var(--ease), transform 0.18s var(--ease);
+  }
+  .osd-card.show { opacity: 1; transform: translateY(0); }
+  .osd-title {
+    font-family: var(--font-sans);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .osd-row { display: flex; justify-content: space-between; gap: 16px; }
+  .osd-row span:last-child { color: var(--text); font-weight: 600; }
+
+  /* Floating Chrome Shared Animation */
+  .top-chrome, .bottom-dock {
+    transition: opacity 0.26s var(--ease-spring), transform 0.28s var(--ease-spring);
+  }
+  .player-frame.is-resizing .chrome-scrim,
+  .player-frame.is-resizing .top-chrome,
+  .player-frame.is-resizing .bottom-dock,
+  .player-frame.is-resizing .lock-fab,
+  .player-frame.is-resizing .crystal-flyout,
+  .player-frame.is-resizing .vol-bubble,
+  .player-frame.is-resizing .ep-sheet,
+  .player-frame.is-resizing .countdown-card,
+  .player-frame.is-resizing .osd-card,
+  .player-frame.is-resizing .loading-pill,
+  .player-frame.is-resizing .center-toast,
+  .player-frame.is-resizing .boost-pill {
+    transition: none !important;
+  }
+  .player-frame.is-idle .top-chrome,
+  .player-frame.is-locked .top-chrome {
+    opacity: 0;
+    transform: translateY(-16px) scale(0.985);
+    pointer-events: none !important;
+  }
+  .player-frame.is-idle .bottom-dock,
+  .player-frame.is-locked .bottom-dock {
+    opacity: 0;
+    transform: translateY(18px) scale(0.985);
+    pointer-events: none !important;
+  }
+
+  /* Top Dual Micro-Islands */
+  .top-chrome {
+    position: absolute;
+    top: 12px;
+    left: 14px;
+    right: 14px;
+    z-index: 25;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    pointer-events: none;
+  }
+  .island {
+    pointer-events: auto;
+    display: flex;
+    align-items: center;
+    height: 40px;
+    padding: 0 6px;
+    border-radius: var(--radius-island);
+    background: var(--glass-bg);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(26px) saturate(140%);
+    box-shadow: var(--inner-highlight), var(--inner-rim), var(--shadow);
+    transition: background-color 0.22s var(--ease), border-color 0.22s var(--ease), box-shadow 0.22s var(--ease);
+  }
+  .top-left-island {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 560px;
+    overflow: hidden;
+    gap: 4px;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+  }
+  .win-island {
+    flex: 0 0 auto;
+    gap: 2px;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+  }
+  .island-sep {
+    width: 1px;
+    height: 16px;
+    background: var(--border);
+    margin: 0 3px;
+    flex-shrink: 0;
+  }
+  .drag-title-area {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 28px;
+    flex: 1 1 0%;
+    overflow: hidden;
+    padding: 0 6px;
+    height: 100%;
+    cursor: grab;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+  }
+  .drag-title-area:active { cursor: grabbing; }
+  .title-text {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+  .ep-pill {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 26px;
+    padding: 0 9px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--accent-soft);
+    color: var(--text);
+    font-size: 11.5px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.16s var(--ease), border-color 0.16s var(--ease), transform 0.12s var(--ease);
+  }
+  .ep-pill:hover {
+    background: var(--glass-active);
+    border-color: var(--border-strong);
+  }
+  .ep-pill:active { transform: scale(0.95); }
+
+  /* Buttons & Pills */
+  .ic-btn {
+    width: 30px;
+    height: 30px;
+    border: none;
+    border-radius: 9px;
+    background: transparent;
+    color: var(--text-sub);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    position: relative;
+    flex-shrink: 0;
+    transition: background 0.15s var(--ease), color 0.15s var(--ease), transform 0.12s var(--ease);
+  }
+  .ic-btn svg, .dock-btn svg { width: 16px; height: 16px; display: block; }
+  .ic-btn:hover { background: var(--glass-hover); color: var(--text); }
+  .ic-btn:active { transform: scale(0.91); }
+  .ic-btn.is-active {
+    background: var(--accent);
+    color: var(--accent-fg);
+  }
+  .ic-btn.win-close:hover {
+    background: var(--accent);
+    color: var(--accent-fg);
+  }
+
+  .chip-btn {
+    height: 28px;
+    padding: 0 9px;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-sub);
+    font-size: 12px;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition: background 0.15s var(--ease), color 0.15s var(--ease), border-color 0.15s var(--ease), transform 0.12s var(--ease);
+  }
+  .chip-btn:hover { background: var(--glass-hover); color: var(--text); }
+  .chip-btn:active { transform: scale(0.94); }
+  .chip-btn.is-active {
+    background: var(--accent-soft);
+    color: var(--text);
+    border-color: var(--accent-border);
+  }
+  .chip-btn .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    transition: background-color 0.2s, box-shadow 0.2s;
+  }
+  .chip-btn.is-active .dot {
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+    animation: pulseDot 2.2s ease-in-out infinite;
+  }
+  @keyframes pulseDot {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.58; transform: scale(0.86); }
+  }
+
+  /* Unified Accessible Monochrome Focus Ring (keyboard Tab navigation only) */
+  button:focus, input:focus { outline: none; }
+  html:not(.kbd-nav) *:focus-visible { outline: none !important; }
+  html.kbd-nav .ic-btn:focus-visible,
+  html.kbd-nav .dock-btn:focus-visible,
+  html.kbd-nav .dock-play:focus-visible,
+  html.kbd-nav .chip-btn:focus-visible,
+  html.kbd-nav .ep-pill:focus-visible,
+  html.kbd-nav .menu-opt:focus-visible,
+  html.kbd-nav .seg-pill:focus-visible,
+  html.kbd-nav .preset-btn:focus-visible,
+  html.kbd-nav .tool-btn:focus-visible,
+  html.kbd-nav .mini-pill:focus-visible,
+  html.kbd-nav .ep-cell:focus-visible,
+  html.kbd-nav .lock-fab:focus-visible,
+  html.kbd-nav .countdown-actions button:focus-visible,
+  html.kbd-nav .dm-swatch:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  /* Bottom Crystal Dock */
+  .bottom-dock {
+    position: absolute;
+    left: 16px;
+    right: 16px;
+    bottom: 14px;
+    z-index: 30;
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 7px 10px;
+    border-radius: var(--radius-panel);
+    background: var(--glass-bg);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(28px) saturate(140%);
+    box-shadow: var(--inner-highlight), var(--inner-rim), var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    transition: opacity 0.26s var(--ease-spring), transform 0.28s var(--ease-spring), background-color 0.22s var(--ease), border-color 0.22s var(--ease), box-shadow 0.22s var(--ease);
+  }
+  .dock-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+  }
+  .dock-row-compact-scrub { display: none; }
+  .dock-left, .dock-right {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    flex-shrink: 0;
+  }
+  .dock-btn {
+    width: 32px;
+    height: 32px;
+    border: none;
+    border-radius: 9px;
+    background: transparent;
+    color: var(--text-sub);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background 0.15s var(--ease), color 0.15s var(--ease), transform 0.12s var(--ease);
+  }
+  .dock-btn:hover { background: var(--glass-hover); color: var(--text); }
+  .dock-btn:active { transform: scale(0.91); }
+  .dock-btn.is-active {
+    background: var(--accent-soft);
+    color: var(--text);
+    box-shadow: inset 0 0 0 1px var(--accent-border);
+  }
+  .dock-play {
+    width: 36px;
+    height: 34px;
+    border-radius: 10px;
+    background: var(--accent);
+    color: var(--accent-fg);
+    border: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.22);
+    transition: transform 0.14s var(--ease-spring), opacity 0.15s, box-shadow 0.15s;
+  }
+  .dock-play:hover { opacity: 0.92; transform: scale(1.04); }
+  .dock-play:active { transform: scale(0.93); }
+  .dock-play svg { width: 17px; height: 17px; }
+
+  /* RollingNumber Time (crisp fixed cell height prevents overlap/clip) */
+  .time-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    padding: 0 5px;
+    flex-shrink: 0;
+    height: 20px;
+  }
+  .time-cur { color: var(--text); font-weight: 600; }
+  .time-sep { color: var(--text-muted); }
+  .time-dur { color: var(--text-sub); }
+  .roller {
+    display: inline-flex;
+    align-items: center;
+    height: 18px;
+    line-height: 18px;
+  }
+  .roll-col {
+    display: inline-block;
+    width: 7.5px;
+    height: 18px;
+    overflow: hidden;
+    position: relative;
+  }
+  .roll-strip {
+    display: flex;
+    flex-direction: column;
+    transition: transform 0.24s var(--ease);
+    will-change: transform;
+  }
+  .roll-strip span {
+    display: block;
+    height: 18px;
+    line-height: 18px;
+    text-align: center;
+  }
+  .roll-colon {
+    display: inline-block;
+    width: 6px;
+    height: 18px;
+    line-height: 18px;
+    text-align: center;
+  }
+
+  /* Progress Scrub Bar */
+  .scrub-wrap {
+    flex: 1 1 auto;
+    min-width: 64px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    position: relative;
+    cursor: pointer;
+    touch-action: none;
+  }
+  .scrub-track {
+    width: 100%;
+    height: 4px;
+    border-radius: 999px;
+    background: var(--track-bg);
+    position: relative;
+    overflow: visible;
+    transition: height 0.14s var(--ease);
+  }
+  .scrub-wrap:hover .scrub-track,
+  .scrub-wrap.scrubbing .scrub-track { height: 6px; }
+  .scrub-buf {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 0%;
+    border-radius: 999px;
+    background: var(--buf-bg);
+    pointer-events: none;
+  }
+  .scrub-fill {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 0%;
+    border-radius: 999px;
+    background: var(--fill-bg);
+    pointer-events: none;
+  }
+  .scrub-ab {
+    position: absolute;
+    top: -1px;
+    bottom: -1px;
+    background: var(--accent-soft);
+    border-left: 2px solid var(--accent);
+    border-right: 2px solid var(--accent);
+    pointer-events: none;
+    display: none;
+  }
+  .scrub-ab.show { display: block; }
+  .scrub-thumb {
+    position: absolute;
+    top: 50%;
+    left: 0%;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 2px var(--glass-bg), 0 0 0 4px var(--accent-soft), 0 2px 8px rgba(0,0,0,0.45);
+    transform: translate(-50%, -50%) scale(0);
+    transition: transform 0.16s var(--ease-spring), box-shadow 0.16s var(--ease);
+    pointer-events: none;
+  }
+  .scrub-wrap:hover .scrub-thumb,
+  .scrub-wrap.scrubbing .scrub-thumb {
+    transform: translate(-50%, -50%) scale(1);
+  }
+  .scrub-wrap.scrubbing .scrub-thumb {
+    transform: translate(-50%, -50%) scale(1.18);
+  }
+  .scrub-hint {
+    position: absolute;
+    bottom: calc(100% + 7px);
+    left: 0%;
+    transform: translateX(-50%) translateY(3px);
+    padding: 3px 8px;
+    border-radius: 7px;
+    background: var(--tooltip-bg);
+    color: var(--tooltip-fg);
+    border: 1px solid var(--tooltip-border);
+    backdrop-filter: blur(14px);
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.26);
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    font-weight: 600;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.14s var(--ease), transform 0.14s var(--ease);
+    white-space: nowrap;
+  }
+  .scrub-wrap:hover .scrub-hint,
+  .scrub-wrap.scrubbing .scrub-hint {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+
+  /* Idle Mini Progress Bar */
+  .mini-progress {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 3px;
+    z-index: 20;
+    background: rgba(128, 128, 128, 0.36);
+    box-shadow: 0 -1px 0 rgba(255, 255, 255, 0.14);
+    opacity: 0;
+    transform: translateY(100%);
+    pointer-events: none;
+    transition: opacity 0.22s var(--ease), transform 0.22s var(--ease);
+  }
+  .player-frame.show-mini-progress .mini-progress {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  .mini-buf {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 0%;
+    background: rgba(255, 255, 255, 0.28);
+  }
+  .mini-fill {
+    position: relative;
+    height: 100%;
+    width: 0%;
+    background: var(--fill-bg);
+    box-shadow: 0 0 8px var(--accent-soft);
+  }
+
+  /* Flyout Anchor & Smooth Popovers */
+  .rel { position: relative; display: inline-flex; align-items: center; }
+  .crystal-flyout, .vol-bubble {
+    position: absolute;
+    bottom: calc(100% + 12px);
+    right: 0;
+    z-index: 40;
+    max-height: var(--flyout-max-h, calc(100vh - 150px));
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    border-radius: var(--radius-panel);
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(30px) saturate(140%);
+    box-shadow: var(--inner-highlight), var(--inner-rim), var(--shadow);
+    opacity: 0;
+    transform: translateX(var(--flyout-shift-x, 0px)) translateY(10px) scale(0.96);
+    pointer-events: none;
+    transform-origin: bottom right;
+    transition: opacity 0.2s var(--ease-spring), transform 0.22s var(--ease-spring), background-color 0.22s var(--ease), border-color 0.22s var(--ease);
+  }
+  .crystal-flyout.open, .vol-bubble.open {
+    opacity: 1;
+    transform: translateX(var(--flyout-shift-x, 0px)) translateY(0) scale(1);
+    pointer-events: auto;
+  }
+
+  /* Invisible pointer hover bridge between trigger button and flyout */
+  .crystal-flyout.open::after, .vol-bubble.open::after {
+    content: "";
+    position: absolute;
+    left: -8px;
+    right: -8px;
+    top: 100%;
+    height: var(--flyout-bridge-h, 16px);
+  }
+
+  .vol-bubble {
+    left: 50%;
+    right: auto;
+    overflow: visible;
+    max-height: none;
+    transform: translateX(calc(-50% + var(--flyout-shift-x, 0px))) translateY(8px) scale(0.96);
+    transform-origin: bottom center;
+    width: 48px;
+    padding: 12px 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+  .vol-bubble.open { transform: translateX(calc(-50% + var(--flyout-shift-x, 0px))) translateY(0) scale(1); }
+  .vol-pct {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text);
+    padding: 1px 5px;
+    border-radius: 999px;
+    transition: background-color 0.16s var(--ease), border-color 0.16s var(--ease);
+  }
+  .vol-pct.is-boost {
+    background: var(--accent-soft);
+    box-shadow: inset 0 0 0 1px var(--accent-border);
+  }
+  .vol-track {
+    width: 6px;
+    height: 104px;
+    border-radius: 999px;
+    background: var(--track-bg);
+    position: relative;
+    cursor: pointer;
+    touch-action: none;
+  }
+  .vol-unity-mark {
+    position: absolute;
+    left: -3px;
+    right: -3px;
+    bottom: 76.923%;
+    height: 1.5px;
+    border-radius: 999px;
+    background: var(--border-strong);
+    pointer-events: none;
+  }
+  .vol-fill {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 75%;
+    border-radius: 999px;
+    background: var(--fill-bg);
+    pointer-events: none;
+  }
+  .vol-thumb {
+    position: absolute;
+    left: 50%;
+    bottom: 75%;
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 1px 6px rgba(0,0,0,0.35);
+    transform: translate(-50%, 50%);
+    pointer-events: none;
+  }
+
+  /* Speed & FG Menus */
+  .compact-menu {
+    min-width: 148px;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .menu-head {
+    padding: 4px 8px 6px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .menu-opt {
+    height: 30px;
+    padding: 0 10px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-sub);
+    font-size: 12.5px;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+    cursor: pointer;
+    transition: background 0.14s var(--ease), color 0.14s var(--ease), transform 0.1s var(--ease);
+  }
+  .menu-opt:hover { background: var(--glass-hover); color: var(--text); }
+  .menu-opt:active { transform: scale(0.97); }
+  .menu-opt.is-active {
+    background: var(--accent);
+    color: var(--accent-fg);
+    font-weight: 600;
+  }
+  .seg-row {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 4px;
+    padding: 4px 2px 2px;
+  }
+  .seg-pill {
+    height: 26px;
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text-sub);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.14s var(--ease), color 0.14s var(--ease), border-color 0.14s var(--ease), transform 0.1s var(--ease);
+  }
+  .seg-pill:hover { background: var(--glass-hover); color: var(--text); }
+  .seg-pill:active { transform: scale(0.95); }
+  .seg-pill.is-active {
+    background: var(--accent);
+    color: var(--accent-fg);
+    border-color: var(--accent);
+  }
+
+  /* Bento Toolbox Flyout */
+  .tools-menu {
+    width: min(560px, calc(var(--frame-w, 100vw) - 28px));
+    max-height: var(--flyout-max-h, calc(var(--frame-h, 100vh) - 150px));
+    overflow-y: auto;
+    overflow-x: hidden !important;
+    padding: 12px;
+  }
+  .tools-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 0 4px 10px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 10px;
+    font-size: 12px;
+  }
+  .tools-top strong { font-weight: 600; color: var(--text); white-space: nowrap; }
+  .tools-top span { color: var(--text-muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tools-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    min-width: 0;
+  }
+  .bento-col { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  .bento-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px 11px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+    transition: border-color 0.18s var(--ease), background-color 0.18s var(--ease);
+  }
+  .bento-card:hover { border-color: var(--border-strong); }
+  .bento-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-width: 0;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .mini-pill {
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-sub);
+    font-size: 11px;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background 0.14s var(--ease), color 0.14s var(--ease), transform 0.1s var(--ease);
+  }
+  .mini-pill:hover { background: var(--glass-hover); color: var(--text); }
+  .mini-pill:active { transform: scale(0.94); }
+
+  .preset-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 4px;
+    min-width: 0;
+  }
+  .preset-btn {
+    height: 26px;
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text-sub);
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.14s var(--ease), color 0.14s var(--ease), border-color 0.14s var(--ease), transform 0.1s var(--ease);
+  }
+  .preset-btn:hover { background: var(--glass-hover); color: var(--text); }
+  .preset-btn:active { transform: scale(0.94); }
+  .preset-btn.is-active {
+    background: var(--accent);
+    color: var(--accent-fg);
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+
+  .slider-row {
+    display: grid;
+    grid-template-columns: 50px minmax(0, 1fr) 38px;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    font-size: 11.5px;
+    color: var(--text-sub);
+  }
+  .slider-row span:first-child { white-space: nowrap; }
+  .slider-row span:last-child {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    color: var(--text);
+  }
+  input[type="range"].crystal-range {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    min-width: 0;
+    height: 4px;
+    border-radius: 999px;
+    background: linear-gradient(
+      90deg,
+      var(--track-bg) 0%,
+      var(--track-bg) var(--fill-start, 0%),
+      var(--fill-bg) var(--fill-start, 0%),
+      var(--fill-bg) var(--fill-end, 0%),
+      var(--track-bg) var(--fill-end, 0%),
+      var(--track-bg) 100%
+    );
+    outline: none;
+    cursor: pointer;
+    transition: height 0.14s var(--ease);
+  }
+  input[type="range"].crystal-range:hover {
+    height: 5px;
+  }
+  input[type="range"].crystal-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 2px var(--panel-bg), 0 1px 4px rgba(0,0,0,0.35);
+    cursor: pointer;
+    transition: transform 0.14s var(--ease-spring), box-shadow 0.14s var(--ease);
+  }
+  input[type="range"].crystal-range:hover::-webkit-slider-thumb,
+  input[type="range"].crystal-range:active::-webkit-slider-thumb {
+    transform: scale(1.18);
+    box-shadow: 0 0 0 3px var(--accent-soft), 0 1px 6px rgba(0,0,0,0.45);
+  }
+  html.kbd-nav input[type="range"].crystal-range:focus-visible::-webkit-slider-thumb {
+    box-shadow: 0 0 0 2px var(--panel-bg), 0 0 0 4px var(--accent);
+  }
+
+  .action-2col {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    min-width: 0;
+  }
+  .action-3col {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 5px;
+    min-width: 0;
+  }
+  .tool-btn {
+    height: 28px;
+    min-width: 0;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-sub);
+    font-size: 11.5px;
+    font-weight: 500;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: background 0.14s var(--ease), color 0.14s var(--ease), border-color 0.14s var(--ease), transform 0.1s var(--ease);
+  }
+  .tool-btn:hover { background: var(--glass-hover); color: var(--text); }
+  .tool-btn:active { transform: scale(0.96); }
+  .tool-btn.is-active {
+    background: var(--accent);
+    color: var(--accent-fg);
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+
+  /* Monochrome Switch */
+  .switch {
+    position: relative;
+    display: inline-block;
+    width: 34px;
+    height: 19px;
+    flex-shrink: 0;
+  }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch-track {
+    position: absolute;
+    inset: 0;
+    border-radius: 999px;
+    background: var(--track-bg);
+    cursor: pointer;
+    transition: background 0.18s;
+  }
+  .switch-track::before {
+    content: "";
+    position: absolute;
+    width: 13px;
+    height: 13px;
+    left: 3px;
+    top: 3px;
+    border-radius: 50%;
+    background: var(--text);
+    transition: transform 0.2s var(--ease-spring), background 0.18s;
+  }
+  .switch input:checked + .switch-track { background: var(--accent); }
+  .switch input:checked + .switch-track::before {
+    transform: translateX(15px);
+    background: var(--accent-fg);
+  }
+
+  .dm-font-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 11.5px;
+    color: var(--text-sub);
+  }
+  .dm-bold-btn.is-active {
+    background: var(--accent);
+    color: var(--accent-fg);
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+  .dm-font-row {
+    padding: 0;
+  }
+  #dmColorPicker {
+    width: 18px !important;
+    height: 18px !important;
+    border-radius: 50%;
+    overflow: hidden;
+    border: none !important;
+    background: transparent !important;
+    padding: 0 !important;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: transform 0.14s var(--ease-spring);
+  }
+  #dmColorPicker:hover { transform: scale(1.1); }
+  #dmColorPicker::-webkit-color-swatch-wrapper { padding: 0; }
+  #dmColorPicker::-webkit-color-swatch {
+    border: 1.5px solid var(--border-strong);
+    border-radius: 50%;
+  }
+  .dm-swatches {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .dm-swatch {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 1.5px solid var(--border);
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: transform 0.14s var(--ease-spring), border-color 0.14s;
+  }
+  .dm-swatch:hover { transform: scale(1.1); }
+  .dm-swatch.is-active {
+    transform: scale(1.16);
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1.5px var(--glass-bg);
+  }
+
+  /* Lock Floating Action Button */
+  .lock-fab {
+    position: absolute;
+    right: 16px;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 22;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: var(--glass-bg);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(22px);
+    color: var(--text-sub);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: var(--inner-highlight), var(--inner-rim), var(--shadow);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.22s var(--ease), transform 0.16s var(--ease-spring), color 0.15s, border-color 0.15s;
+  }
+  .lock-fab:hover { border-color: var(--border-strong); color: var(--text); }
+  .lock-fab svg { width: 15px; height: 15px; }
+  .lock-fab:active { transform: translateY(-50%) scale(0.91); }
+  .player-frame:hover .lock-fab,
+  .player-frame.is-locked .lock-fab { opacity: 1; pointer-events: auto; }
+  .player-frame.is-idle .lock-fab { opacity: 0; pointer-events: none; }
+  .player-frame.is-locked.is-idle .lock-fab { opacity: 0; pointer-events: none; }
+  .player-frame.is-locked:not(.is-idle) .lock-fab:hover { opacity: 1; pointer-events: auto; color: var(--text); }
+  .lock-fab.hidden-for-panel { opacity: 0 !important; pointer-events: none !important; }
+
+  /* Center Episode Sheet */
+  .ep-sheet {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -48%) scale(0.95);
+    z-index: 40;
+    width: min(460px, calc(var(--frame-w, 100vw) - 28px));
+    max-height: min(420px, calc(var(--frame-h, 100vh) - 136px));
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(30px) saturate(140%);
+    border-radius: 18px;
+    box-shadow: var(--inner-highlight), var(--inner-rim), var(--shadow);
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overflow: hidden;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s var(--ease-spring), transform 0.22s var(--ease-spring), background-color 0.22s var(--ease), border-color 0.22s var(--ease);
+  }
+  .ep-sheet.open {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+    pointer-events: auto;
+  }
+  .ep-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .ep-head h3 { font-size: 13.5px; font-weight: 600; color: var(--text); }
+  .ep-search {
+    height: 30px;
+    border-radius: 9px;
+    border: 1px solid var(--border);
+    background: var(--card-bg);
+    color: var(--text);
+    padding: 0 10px;
+    font-size: 12px;
+    outline: none;
+    width: 138px;
+    transition: border-color 0.15s, background-color 0.15s;
+  }
+  .ep-search:focus { border-color: var(--border-strong); background: var(--glass-hover); }
+  .ep-grid {
+    overflow-y: auto;
+    overflow-x: hidden;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(56px, 1fr));
+    gap: 6px;
+    padding-right: 4px;
+    min-width: 0;
+  }
+  .ep-cell {
+    height: 34px;
+    border-radius: 9px;
+    border: 1px solid var(--border);
+    background: var(--card-bg);
+    color: var(--text-sub);
+    font-size: 12px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+    transition: background 0.14s var(--ease), color 0.14s var(--ease), border-color 0.14s var(--ease), transform 0.1s var(--ease);
+  }
+  .ep-cell:hover { background: var(--glass-hover); color: var(--text); border-color: var(--border-strong); }
+  .ep-cell:active { transform: scale(0.95); }
+  .ep-cell.is-current {
+    background: var(--accent);
+    color: var(--accent-fg);
+    border-color: var(--accent);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.22);
+  }
+
+  /* Hold 3x Boost Pill & Countdown Card & Center Toast */
+  .boost-pill {
+    position: absolute;
+    top: 64px;
+    left: 50%;
+    transform: translateX(-50%) translateY(-8px) scale(0.96);
+    z-index: 60;
+    padding: 6px 14px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--accent-fg);
+    font-size: 12px;
+    font-weight: 700;
+    box-shadow: var(--shadow);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s var(--ease-spring), transform 0.18s var(--ease-spring);
+  }
+  .boost-pill.show { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+
+  .countdown-card {
+    position: absolute;
+    right: 18px;
+    bottom: 84px;
+    z-index: 60;
+    width: 248px;
+    padding: 12px 14px;
+    border-radius: 14px;
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(28px);
+    box-shadow: var(--inner-highlight), var(--inner-rim), var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    opacity: 0;
+    transform: translateY(12px) scale(0.96);
+    pointer-events: none;
+    transition: opacity 0.22s var(--ease-spring), transform 0.22s var(--ease-spring);
+  }
+  .countdown-card.show {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    pointer-events: auto;
+  }
+  .countdown-title { font-size: 12.5px; font-weight: 600; color: var(--text); }
+  .countdown-sub { font-size: 11.5px; color: var(--text-sub); }
+  .countdown-actions { display: flex; gap: 6px; }
+  .countdown-actions button {
+    flex: 1;
+    height: 28px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.1s var(--ease), opacity 0.15s;
+  }
+  .countdown-actions button:active { transform: scale(0.95); }
+  .cd-go { background: var(--accent); color: var(--accent-fg); border: none; }
+  .cd-cancel { background: transparent; color: var(--text-sub); border: 1px solid var(--border); }
+
+  .center-toast {
+    position: absolute;
+    left: 50%;
+    top: 44%;
+    transform: translate(-50%, -50%) scale(0.90);
+    z-index: 65;
+    padding: 8px 15px 8px 10px;
+    border-radius: 999px;
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(24px);
+    color: var(--text);
+    font-size: 12.5px;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    box-shadow: var(--inner-highlight), var(--inner-rim), var(--shadow);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s var(--ease-spring), transform 0.22s var(--ease-spring);
+  }
+  .center-toast.show { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  .toast-icon-badge {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--text);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .center-toast svg { width: 14px; height: 14px; display: block; }
+
+  /* Shortcuts Modal */
+  .shortcut-modal {
+    position: absolute;
+    inset: 0;
+    z-index: 75;
+    background: var(--modal-backdrop);
+    backdrop-filter: blur(6px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s var(--ease);
+  }
+  .shortcut-modal.open { opacity: 1; pointer-events: auto; }
+  .shortcut-box {
+    width: min(500px, calc(var(--frame-w, 100vw) - 32px));
+    max-height: calc(var(--frame-h, 100vh) - 96px);
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 16px;
+    border-radius: 16px;
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    box-shadow: var(--inner-highlight), var(--inner-rim), var(--shadow);
+    transform: translateY(10px) scale(0.96);
+    transition: transform 0.24s var(--ease-spring), background-color 0.22s var(--ease), border-color 0.22s var(--ease);
+  }
+  .shortcut-modal.open .shortcut-box {
+    transform: translateY(0) scale(1);
+  }
+  .shortcut-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .shortcut-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px 14px;
+    font-size: 12px;
+  }
+  .sc-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    color: var(--text-sub);
+  }
+  .kbd {
+    padding: 2px 6px;
+    border-radius: 5px;
+    border: 1px solid var(--border);
+    background: var(--card-bg);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text);
+  }
+
+  /* Responsive Compact / 4:3 / Portrait 9:16 / Landscape 16:9 / Ultra-Narrow PiP */
+  .compact-only-block { display: none; flex-direction: column; gap: 6px; }
+  .player-frame.is-narrow .compact-only-block { display: flex; }
+  .compact-rate-grid {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 4px;
+  }
+
+  .player-frame.is-narrow .hide-compact { display: none !important; }
+  .player-frame.is-compact .top-chrome { left: 10px; right: 10px; top: 10px; gap: 8px; }
+  .player-frame.is-compact .island { height: 36px; padding: 0 5px; }
+  .player-frame.is-compact .ic-btn { width: 26px; height: 26px; border-radius: 7px; }
+  .player-frame.is-compact .chip-btn { height: 25px; padding: 0 7px; font-size: 11px; }
+  .player-frame.is-compact .ep-pill { height: 24px; padding: 0 7px; font-size: 11px; }
+  .player-frame.is-compact .top-left-island { max-width: none; min-width: 0; flex: 0 1 auto; overflow: hidden; gap: 2px; }
+  .player-frame.is-compact .drag-title-area { min-width: 20px; padding: 0 4px; flex: 0 1 auto; }
+  .player-frame.is-compact .title-text { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .player-frame.is-compact .tools-grid,
+  .player-frame.is-tools-single .tools-grid { grid-template-columns: minmax(0, 1fr); }
+  .player-frame.is-compact .shortcut-grid { grid-template-columns: minmax(0, 1fr); }
+  .player-frame.is-compact .bottom-dock {
+    left: 10px;
+    right: 10px;
+    bottom: 10px;
+    padding: 7px 10px 6px;
+    gap: 5px;
+  }
+  .player-frame.is-compact #mainDockRow { justify-content: space-between; gap: 6px; }
+  .player-frame.is-compact .dock-left,
+  .player-frame.is-compact .dock-right { gap: 2px; min-width: 0; }
+  .player-frame.is-compact .dock-btn { width: 28px; height: 28px; border-radius: 8px; }
+  .player-frame.is-compact .dock-play { width: 32px; height: 30px; border-radius: 9px; }
+  .player-frame.is-compact .time-wrap { font-size: 11px; margin-left: 3px; }
+  .player-frame.is-compact .dock-row-compact-scrub { display: flex; padding: 0 2px; }
+  .player-frame.is-compact .scrub-wrap { margin: 0; padding: 3px 2px; width: 100%; }
+
+  /* 9:16 Portrait Window & Fullscreen Balance */
+  .player-frame.is-tall-window .ep-sheet {
+    width: min(440px, calc(var(--frame-w, 100vw) - 24px));
+    max-height: min(620px, calc(var(--frame-h, 100vh) - 156px));
+  }
+  .player-frame.is-tall-window .countdown-card {
+    left: 12px;
+    right: 12px;
+    width: auto;
+    bottom: 98px;
+  }
+  .player-frame.is-portrait-fullscreen .bottom-dock {
+    max-width: 780px;
+  }
+  .player-frame.is-portrait-fullscreen .chrome-scrim-top { height: 76px; }
+
+  .player-frame.is-ultra-narrow .title-text,
+  .player-frame.is-ultra-narrow .hide-ultra { display: none !important; }
+  .player-frame.is-ultra-narrow .top-left-island { max-width: none; min-width: 0; flex: 1 1 0%; overflow: hidden; }
+
+  /* 弹幕排版与红果彩色表情隔离渲染（避免多层描边糊掉彩色 emoji） */
+  .dm-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 1px;
+    font-family: 'Microsoft YaHei UI', 'PingFang SC', 'Segoe UI', system-ui, sans-serif;
+    font-weight: 600;
+    letter-spacing: 0.012em;
+    line-height: 1.3;
+    text-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.92),
+      0 -1px 2px rgba(0, 0, 0, 0.7),
+      1px 0 2px rgba(0, 0, 0, 0.7),
+      -1px 0 2px rgba(0, 0, 0, 0.7),
+      0 2px 6px rgba(0, 0, 0, 0.52);
+    will-change: transform;
+  }
+  .dm-text {
+    white-space: pre;
+  }
+  .dm-emoji {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Segoe UI Emoji', 'Apple Color Emoji', 'Noto Color Emoji', sans-serif;
+    font-size: 1.15em;
+    line-height: 1;
+    font-weight: 400;
+    font-style: normal;
+    margin: 0 1.5px;
+    vertical-align: -0.08em;
+    text-shadow: none !important;
+    filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.78));
+  }
+
+  /* 控制栏弹幕快捷开关 */
+  .dm-toggle-btn {
+    position: relative;
+  }
+  .dm-toggle-btn.is-on {
+    color: var(--accent);
+    background: var(--glass-hover);
+  }
+  .dm-toggle-btn.is-on::after {
+    content: "";
+    position: absolute;
+    right: 6px;
+    bottom: 6px;
+    width: 5px;
+    height: 5px;
+    border-radius: 999px;
+    background: var(--accent);
+    box-shadow: 0 0 0 1.5px var(--surface-solid, rgba(16, 17, 21, 0.88));
+  }
+
+  /* Crystal Monochrome 小窗 / 画中画识别 HUD（.is-pip） */
+  .pip-hud {
+    position: absolute;
+    inset: 0;
+    z-index: 26;
+    display: none;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 8px 10px 9px;
+    pointer-events: none;
+    opacity: 1;
+    transition: opacity 0.22s ease;
+    background:
+      linear-gradient(180deg, rgba(8, 10, 14, 0.42) 0%, transparent 26%, transparent 68%, rgba(8, 10, 14, 0.54) 100%);
+  }
+  .player-frame[data-theme="light"] .pip-hud {
+    background:
+      linear-gradient(180deg, rgba(16, 18, 24, 0.22) 0%, transparent 26%, transparent 68%, rgba(16, 18, 24, 0.28) 100%);
+  }
+  .player-frame.is-pip .pip-hud {
+    display: flex;
+  }
+  .player-frame.is-pip .top-chrome,
+  .player-frame.is-pip .bottom-dock,
+  .player-frame.is-pip .lock-fab {
+    display: none !important;
+  }
+  .player-frame.is-pip.is-idle .pip-hud,
+  .player-frame.is-pip.is-idle .pip-hud * {
+    opacity: 0;
+    pointer-events: none !important;
+  }
+  .pip-topbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    padding: 4px 5px 4px 7px;
+    border-radius: 999px;
+    background: var(--glass-bg);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow), var(--inner-highlight);
+    backdrop-filter: blur(18px) saturate(150%);
+    -webkit-backdrop-filter: blur(18px) saturate(150%);
+    pointer-events: auto;
+    cursor: grab;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .pip-topbar:active {
+    cursor: grabbing;
+  }
+  .pip-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex: 0 0 auto;
+    height: 22px;
+    padding: 0 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--glass-hover);
+    color: var(--text);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.16s ease, transform 0.14s ease;
+  }
+  .pip-badge:hover {
+    background: var(--chip-bg, var(--glass-hover));
+  }
+  .pip-badge-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--accent);
+    flex: 0 0 auto;
+  }
+  .pip-title {
+    flex: 1 1 0%;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--text);
+    opacity: 0.92;
+  }
+  .pip-actions {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex: 0 0 auto;
+  }
+  .pip-ic {
+    width: 26px;
+    height: 26px;
+    border-radius: 999px;
+    border: 0;
+    background: transparent;
+    color: var(--text-dim, var(--text));
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease, transform 0.12s ease;
+  }
+  .pip-ic:hover {
+    background: var(--glass-hover);
+    color: var(--text);
+  }
+  .pip-ic:active {
+    transform: scale(0.92);
+  }
+  .pip-ic.is-active {
+    color: var(--accent);
+  }
+  .pip-ic svg {
+    width: 14px;
+    height: 14px;
+  }
+  .pip-center-transport {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    pointer-events: auto;
+  }
+  .pip-tr-btn,
+  .pip-tr-play {
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--glass-bg);
+    color: var(--text);
+    box-shadow: var(--shadow), var(--inner-highlight);
+    backdrop-filter: blur(18px) saturate(150%);
+    -webkit-backdrop-filter: blur(18px) saturate(150%);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: transform 0.14s ease, background 0.16s ease, opacity 0.16s ease;
+  }
+  .pip-tr-btn {
+    width: 34px;
+    height: 34px;
+  }
+  .pip-tr-btn svg {
+    width: 15px;
+    height: 15px;
+  }
+  .pip-tr-play {
+    width: 44px;
+    height: 44px;
+  }
+  .pip-tr-play svg {
+    width: 20px;
+    height: 20px;
+  }
+  .pip-tr-btn:hover,
+  .pip-tr-play:hover {
+    background: var(--glass-hover);
+    transform: scale(1.06);
+  }
+  .pip-tr-btn:active,
+  .pip-tr-play:active {
+    transform: scale(0.94);
+  }
+  .pip-tr-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+    transform: none;
+  }
+  .pip-bottom-dock {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px 9px 7px;
+    border-radius: 14px;
+    background: var(--glass-bg);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow), var(--inner-highlight);
+    backdrop-filter: blur(18px) saturate(150%);
+    -webkit-backdrop-filter: blur(18px) saturate(150%);
+    pointer-events: auto;
+  }
+  .pip-scrub-slot {
+    width: 100%;
+    min-width: 0;
+  }
+  .player-frame.is-pip .scrub-wrap {
+    width: 100%;
+    margin: 0;
+    padding: 4px 0 2px;
+  }
+  .pip-dock-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    min-width: 0;
+  }
+  .pip-time {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+    opacity: 0.88;
+    white-space: nowrap;
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+  .pip-time-sep {
+    opacity: 0.45;
+  }
+  .pip-controls {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    flex: 0 0 auto;
+  }
+  .pip-rate-chip {
+    height: 22px;
+    padding: 0 7px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    font-size: 11px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  .pip-rate-chip:hover {
+    background: var(--glass-hover);
+  }
+  .player-frame.is-pip-tiny .pip-title,
+  .player-frame.is-pip-tiny #pipTheme {
+    display: none !important;
+  }
+  .player-frame.is-pip-tiny .pip-tr-btn {
+    width: 28px;
+    height: 28px;
+  }
+  .player-frame.is-pip-tiny .pip-tr-play {
+    width: 38px;
+    height: 38px;
+  }
+  /* PiP 小窗专用标定：88/112px 的整窗 scrim 与 34px 阴影是按整窗设计的，
+     在 264px 级小窗里会吞掉画面、糊成一整块黑；这里按小窗重新标定。 */
+  .player-frame.is-pip .chrome-scrim {
+    display: none !important;
+  }
+  .player-frame.is-pip .pip-hud {
+    padding: 6px 8px 7px;
+    overflow: hidden;
+    /* 只保留 14px 贴边暗角：26%/74% 的分段渐变在 200px 级小窗里等于糊一层黑 */
+    background:
+      linear-gradient(180deg, rgba(8, 10, 14, 0.46) 0, rgba(8, 10, 14, 0) 14px,
+        rgba(8, 10, 14, 0) calc(100% - 14px), rgba(8, 10, 14, 0.52) 100%);
+  }
+  .player-frame.is-pip .pip-topbar,
+  .player-frame.is-pip .pip-tr-btn,
+  .player-frame.is-pip .pip-tr-play,
+  .player-frame.is-pip .pip-bottom-dock {
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.42), var(--inner-highlight);
+  }
+  .player-frame.is-pip .pip-title {
+    opacity: 1;
+  }
+  /* 单行小窗才用的行内播放/关闭按钮，正常小窗仍走原三块布局 */
+  .pip-play-inline,
+  .pip-close-inline {
+    display: none !important;
+  }
+
+  .player-frame.is-pip .ep-sheet {
+    width: min(260px, calc(100% - 16px));
+    max-height: calc(100% - 64px);
+    top: 46px;
+    left: 8px;
+    right: auto;
+    bottom: auto;
+  }
+  .player-frame.is-pip .center-toast {
+    font-size: 11.5px;
+    padding: 6px 11px;
+  }
+  .player-frame.is-pip .countdown-card {
+    width: min(260px, calc(100% - 20px));
+    padding: 12px 14px;
+  }
+  /* 小窗收敛：<=300px 宽或 <=205px 高（264px@200% = 132 CSS px 也落这一档）
+     只留单行 [时间 · 播放 · 还原 · 关闭]，chrome 总高 34px；
+     任一边长 200 CSS px 时占用 17%，低于 35% 预算。次要控件整块移除而不是缩小。 */
+  .player-frame.is-pip-tiny .pip-hud {
+    --pip-chrome-h: 30px;
+    padding: 0 0 4px;
+    justify-content: flex-end;
+    background:
+      linear-gradient(180deg, rgba(8, 10, 14, 0) calc(100% - 14px), rgba(8, 10, 14, 0.6) 100%);
+  }
+  .player-frame.is-pip-tiny .pip-topbar,
+  .player-frame.is-pip-tiny .pip-center-transport,
+  .player-frame.is-pip-tiny .pip-scrub-slot,
+  .player-frame.is-pip-tiny #pipDm,
+  .player-frame.is-pip-tiny #pipVol,
+  .player-frame.is-pip-tiny #pipRate {
+    display: none !important;
+  }
+  .player-frame.is-pip-tiny .pip-bottom-dock {
+    height: var(--pip-chrome-h);
+    margin: 0 4px;
+    padding: 0 6px;
+    border-radius: 10px;
+    flex-direction: row;
+    align-items: center;
+  }
+  .player-frame.is-pip-tiny .pip-dock-row {
+    width: 100%;
+    gap: 4px;
+  }
+  .player-frame.is-pip-tiny .pip-time {
+    display: inline-flex;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 10.5px;
+  }
+  /* 小窗只留当前时间：总时长和分隔符是冗余，132 CSS px 宽下会和控件抢位 */
+  .player-frame.is-pip-tiny .pip-time-sep,
+  .player-frame.is-pip-tiny #pipTimeDur {
+    display: none !important;
+  }
+  .player-frame.is-pip-tiny .pip-controls {
+    gap: 2px;
+  }
+  .player-frame.is-pip-tiny .pip-ic {
+    width: 22px;
+    height: 22px;
+  }
+  .player-frame.is-pip-tiny .pip-ic svg {
+    width: 13px;
+    height: 13px;
+  }
+  .player-frame.is-pip-tiny .pip-play-inline,
+  .player-frame.is-pip-tiny .pip-close-inline {
+    display: inline-flex !important;
+  }
+</style>
+</head>
+<body data-theme="dark">
+<div class="player-frame" id="playerFrame">
+  <div class="video-stage" id="videoStage"></div>
+  <div class="danmaku-layer" id="danmakuLayer"></div>
+  <div class="chrome-scrim chrome-scrim-top"></div>
+  <div class="chrome-scrim chrome-scrim-bottom"></div>
+
+  <div class="loading-pill" id="loadingPill">
+    <span class="spinner"></span>
+    <span id="loadingText">正在加载视频流…</span>
+  </div>
+
+  <div class="osd-card" id="osdCard">
+    <div class="osd-title">
+      <span>播放实时指标</span>
+      <span id="osdHwdec">—</span>
+    </div>
+    <div class="osd-row"><span>源帧率</span><span id="osdSrcFps">—</span></div>
+    <div class="osd-row"><span>输出帧率</span><span id="osdOutFps">—</span></div>
+    <div class="osd-row"><span>光流补帧</span><span id="osdFgState">—</span></div>
+    <div class="osd-row"><span>分辨率</span><span id="osdRes">—</span></div>
+  </div>
+
+  <!-- Top Dual Crystal Islands -->
+  <div class="top-chrome" id="topChrome">
+    <div class="island top-left-island drag-handle" id="topLeftIsland">
+      <button class="ic-btn" id="btnHome" data-act="home" title="返回主页"></button>
+      <div class="island-sep"></div>
+      <div class="drag-title-area" id="dragArea">
+        <span class="title-text" id="titleText">准备播放</span>
+      </div>
+      <button class="ep-pill" id="epBadge" data-act="drawer" title="选集 (E)">第 1 集</button>
+    </div>
+
+    <div class="island win-island drag-handle" id="winIsland">
+      <button class="chip-btn" id="btnAutoplay" data-act="autoplay" title="自动连播 (A)">
+        <span class="dot"></span><span>连播</span>
+      </button>
+      <button class="ic-btn hide-compact" id="btnShortcuts" data-act="shortcuts" title="快捷键 (? / F1)"></button>
+      <button class="ic-btn hide-compact" id="btnOsd" data-act="osd" title="性能信息 (I)"></button>
+      <button class="ic-btn hide-compact" id="btnPin" data-act="pin" title="窗口置顶 (K)"></button>
+      <button class="ic-btn" id="btnThemeSwitch" data-act="theme" title="切换黑/白主题"></button>
+      <div class="island-sep"></div>
+      <button class="ic-btn hide-ultra" id="btnMin" data-act="min" title="最小化"></button>
+      <button class="ic-btn hide-ultra" id="btnMax" data-act="max" title="最大化 / 还原"></button>
+      <button class="ic-btn win-close" id="btnClose" data-act="close" title="关闭播放器"></button>
+    </div>
+  </div>
+
+  <!-- Lock FAB -->
+  <button class="lock-fab" id="btnLock" data-act="lock" title="锁定 / 解锁界面 (H)"></button>
+
+  <!-- Bottom Floating Crystal Control Dock -->
+  <div class="bottom-dock" id="bottomDock">
+    <!-- Row 1 on compact portrait -->
+    <div class="dock-row dock-row-compact-scrub" id="compactScrubRow"></div>
+
+    <!-- Main Row -->
+    <div class="dock-row" id="mainDockRow">
+      <div class="dock-left">
+        <button class="dock-btn hide-ultra" id="btnPrev" data-act="prev" title="上一集 (P)"></button>
+        <button class="dock-btn hide-compact" id="btnBack10" data-act="seek-rel" data-val="-10" title="快退 10 秒 (←)"></button>
+        <button class="dock-play" id="btnPlay" data-act="play" title="播放 / 暂停 (Space)"></button>
+        <button class="dock-btn hide-compact" id="btnFwd10" data-act="seek-rel" data-val="10" title="快进 10 秒 (→)"></button>
+        <button class="dock-btn hide-ultra" id="btnNext" data-act="next" title="下一集 (N)"></button>
+        <div class="time-wrap">
+          <span class="time-cur" id="rollCur"></span>
+          <span class="time-sep">/</span>
+          <span class="time-dur" id="rollDur"></span>
+        </div>
+      </div>
+
+      <!-- Desktop Scrub Slot -->
+      <div class="scrub-wrap" id="scrubWrap">
+        <div class="scrub-track">
+          <div class="scrub-buf" id="bufBar"></div>
+          <div class="scrub-ab" id="abRangeBar"></div>
+          <div class="scrub-fill" id="playedBar"></div>
+          <div class="scrub-thumb" id="scrubThumb"></div>
+        </div>
+        <div class="scrub-hint" id="scrubHint">00:00</div>
+      </div>
+
+      <div class="dock-right">
+        <div class="rel hide-ultra" data-menu-scope="vol">
+          <button class="dock-btn" id="btnVol" data-act="mute" title="静音 / 滚轮调音量 (M)"></button>
+          <div class="vol-bubble" id="menuVol">
+            <span class="vol-pct" id="volPctLabel">100%</span>
+            <div class="vol-track" id="volTrack">
+              <div class="vol-unity-mark" title="100% 原音"></div>
+              <div class="vol-fill" id="volFill"></div>
+              <div class="vol-thumb" id="volThumb"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="rel hide-compact" data-menu-scope="rate">
+          <button class="chip-btn" id="btnRate" data-menu="rate" title="倍速播放">1.0x</button>
+          <div class="crystal-flyout compact-menu" id="menuRate">
+            <div class="menu-head"><span>播放倍速</span><span>长按 → 3x</span></div>
+            <button class="menu-opt" data-act="rate" data-val="0.5">0.5x</button>
+            <button class="menu-opt" data-act="rate" data-val="0.75">0.75x</button>
+            <button class="menu-opt" data-act="rate" data-val="1">1.0x 正常</button>
+            <button class="menu-opt" data-act="rate" data-val="1.25">1.25x</button>
+            <button class="menu-opt" data-act="rate" data-val="1.5">1.5x</button>
+            <button class="menu-opt" data-act="rate" data-val="2">2.0x</button>
+            <button class="menu-opt" data-act="rate" data-val="3">3.0x</button>
+          </div>
+        </div>
+
+        <div class="rel hide-ultra" data-menu-scope="fg">
+          <button class="chip-btn" id="btnFg" data-menu="fg" title="GPU 光流补帧 (B)">
+            <span class="dot"></span><span id="fgBtnLabel">补帧 2X</span>
+          </button>
+          <div class="crystal-flyout compact-menu" id="menuFg" style="min-width: 196px;">
+            <div class="menu-head"><span>GPU 光流补帧</span><span id="fgFpsMini">—</span></div>
+            <button class="menu-opt" data-act="set-fg" data-val="0">关闭补帧 (原生帧率)</button>
+            <button class="menu-opt" data-act="set-fg" data-val="2">2X 丝滑补帧</button>
+            <button class="menu-opt" data-act="set-fg" data-val="3">3X 高帧畅享</button>
+            <button class="menu-opt" data-act="set-fg" data-val="4">4X 极致高刷</button>
+            <button class="menu-opt" data-act="set-fg" data-val="5">5X 满帧上限</button>
+            <div class="menu-head" style="padding-top:6px;"><span>画面光流模式</span></div>
+            <div class="seg-row">
+              <button class="seg-pill" data-act="fgmode" data-val="auto">自动</button>
+              <button class="seg-pill" data-act="fgmode" data-val="drama">真人</button>
+              <button class="seg-pill" data-act="fgmode" data-val="comic">漫剧</button>
+              <button class="seg-pill" data-act="fgmode" data-val="anime">动漫</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="rel hide-ultra" data-menu-scope="tools">
+          <button class="dock-btn" id="btnTools" data-menu="tools" title="画质与弹幕工具箱"></button>
+          <div class="crystal-flyout tools-menu" id="menuTools">
+            <div class="tools-top">
+              <strong>工具箱 · 实时生效</strong>
+              <span id="toolsSummary">原色 · 适应画面</span>
+            </div>
+            <div class="tools-grid">
+              <div class="bento-col">
+                <div class="bento-card">
+                  <div class="bento-head">
+                    <span>画质调色 (4 通道)</span>
+                    <button class="mini-pill" data-act="pic-reset">重置</button>
+                  </div>
+                  <div class="preset-grid">
+                    <button class="preset-btn" data-act="pic-preset" data-val="orig">原色</button>
+                    <button class="preset-btn" data-act="pic-preset" data-val="vivid">影院</button>
+                    <button class="preset-btn" data-act="pic-preset" data-val="eye">护眼</button>
+                    <button class="preset-btn" data-act="pic-preset" data-val="night">夜间</button>
+                  </div>
+                  <div class="slider-row"><span>亮度</span><input class="crystal-range" type="range" min="-50" max="50" value="0" data-tune="brightness"><span id="valBrightness">0</span></div>
+                  <div class="slider-row"><span>对比度</span><input class="crystal-range" type="range" min="-50" max="50" value="0" data-tune="contrast"><span id="valContrast">0</span></div>
+                  <div class="slider-row"><span>饱和度</span><input class="crystal-range" type="range" min="-50" max="50" value="0" data-tune="saturation"><span id="valSaturation">0</span></div>
+                  <div class="slider-row"><span>伽马</span><input class="crystal-range" type="range" min="-50" max="50" value="0" data-tune="gamma"><span id="valGamma">0</span></div>
+                </div>
+
+                <div class="bento-card">
+                  <div class="bento-head">
+                    <span>画面比例与播控</span>
+                    <span id="aspectLabel" style="font-weight:500;color:var(--text-muted)">适应</span>
+                  </div>
+                  <div class="action-3col">
+                    <button class="tool-btn" data-act="aspect" data-val="fit">适应</button>
+                    <button class="tool-btn" data-act="aspect" data-val="cover">裁剪</button>
+                    <button class="tool-btn" data-act="aspect" data-val="stretch">拉伸</button>
+                  </div>
+                  <div class="action-3col">
+                    <button class="tool-btn" data-act="step-frame" data-val="-1">上一帧</button>
+                    <button class="tool-btn" data-act="step-frame" data-val="1">下一帧</button>
+                    <button class="tool-btn" data-act="shot">截图 S</button>
+                  </div>
+                  <button class="tool-btn" id="btnAbLoop" data-act="ab">A-B 循环 (标记 A 点)</button>
+                  <div class="action-2col">
+                    <button class="tool-btn" id="btnAudioTrack" data-act="cycle-audio">音轨: 默认</button>
+                    <button class="tool-btn" id="btnPip" data-act="pip">小窗预览 关</button>
+                  </div>
+                  <div class="action-2col">
+                    <button class="tool-btn" id="btnFitWindow" data-act="fit-window">窗口贴合比例</button>
+                    <button class="tool-btn" id="btnPinTools" data-act="pin">窗口置顶</button>
+                  </div>
+                  <div class="compact-only-block">
+                    <div style="font-size:11px;color:var(--text-muted);font-weight:600;">快捷倍速</div>
+                    <div class="compact-rate-grid">
+                      <button class="seg-pill" data-act="rate" data-val="0.75">0.75x</button>
+                      <button class="seg-pill" data-act="rate" data-val="1">1x</button>
+                      <button class="seg-pill" data-act="rate" data-val="1.25">1.25x</button>
+                      <button class="seg-pill" data-act="rate" data-val="1.5">1.5x</button>
+                      <button class="seg-pill" data-act="rate" data-val="2">2x</button>
+                    </div>
+                  </div>
+                  <div class="bento-head" style="padding-top:2px;">
+                    <span id="vsrLabel">RTX VSR 超分增强</span>
+                    <label class="switch"><input type="checkbox" id="vsrToggle"><span class="switch-track"></span></label>
+                  </div>
+                </div>
+              </div>
+
+              <div class="bento-card">
+                <div class="bento-head">
+                  <span>弹幕设置 (D)</span>
+                  <label class="switch"><input type="checkbox" id="dmToggle" checked><span class="switch-track"></span></label>
+                </div>
+                <div class="slider-row"><span>显示区域</span><input class="crystal-range" type="range" min="15" max="100" value="25" data-dm-range="region"><span id="valDmRegion">25%</span></div>
+                <div class="slider-row"><span>不透明度</span><input class="crystal-range" type="range" min="15" max="100" value="100" data-dm-range="opacity"><span id="valDmOpacity">100%</span></div>
+                <div class="slider-row"><span>弹幕字号</span><input class="crystal-range" type="range" min="60" max="180" value="100" data-dm-range="fontScale"><span id="valDmFontScale">100%</span></div>
+                <div class="slider-row"><span>弹幕速度</span><input class="crystal-range" type="range" min="4" max="14" value="8" data-dm-range="speedSec"><span id="valDmSpeed">适中</span></div>
+                <div class="dm-font-head">
+                  <span>字体与字重</span>
+                  <button type="button" class="mini-pill dm-bold-btn" id="dmBoldBtn" data-act="dm-bold" aria-pressed="true">粗体</button>
+                </div>
+                <div class="seg-row dm-font-row">
+                  <button type="button" class="seg-pill" data-act="dm-font" data-val="Microsoft YaHei">雅黑</button>
+                  <button type="button" class="seg-pill" data-act="dm-font" data-val="SimHei">黑体</button>
+                  <button type="button" class="seg-pill" data-act="dm-font" data-val="PingFang SC">苹方</button>
+                  <button type="button" class="seg-pill" data-act="dm-font" data-val="KaiTi">楷体</button>
+                </div>
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11.5px;">
+                  <span style="color:var(--text-sub);flex-shrink:0;">颜色</span>
+                  <div class="dm-swatches" id="dmSwatches">
+                    <button class="dm-swatch is-active" data-color="#ffffff" style="background:#ffffff"></button>
+                    <button class="dm-swatch" data-color="#d4d4d8" style="background:#d4d4d8"></button>
+                    <button class="dm-swatch" data-color="#fde047" style="background:#fde047"></button>
+                    <button class="dm-swatch" data-color="#67e8f9" style="background:#67e8f9"></button>
+                    <button class="dm-swatch" data-color="#fca5a5" style="background:#fca5a5"></button>
+                    <input type="color" id="dmColorPicker" value="#ffffff" style="width:22px;height:18px;border:none;background:none;padding:0;cursor:pointer;">
+                  </div>
+                </div>
+                <div style="font-size:11.5px;color:var(--text-sub);margin-top:2px;">描边样式</div>
+                <div class="action-3col">
+                  <button class="tool-btn" data-act="dm-stroke" data-val="heavy">重墨</button>
+                  <button class="tool-btn" data-act="dm-stroke" data-val="outline">描边</button>
+                  <button class="tool-btn" data-act="dm-stroke" data-val="shadow">投影</button>
+                </div>
+                <button class="tool-btn" data-act="dm-reset" style="margin-top:auto;">恢复弹幕默认设置</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <button class="dock-btn dm-toggle-btn hide-ultra" id="btnDanmaku" data-act="dm-toggle" title="弹幕开关 (D)"></button>
+        <button class="dock-btn hide-ultra" id="btnDrawer" data-act="drawer" title="选集列表 (E)"></button>
+        <button class="dock-btn" id="btnFull" data-act="full" title="全屏 (F / F11)"></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Crystal Monochrome 小窗 / 画中画识别 HUD -->
+  <div class="pip-hud" id="pipHud">
+    <div class="pip-topbar drag-handle" id="pipTopbar">
+      <button class="pip-badge" id="pipEpBtn" data-act="drawer" title="选集列表 (E)">
+        <span class="pip-badge-dot"></span>
+        <span>小窗</span>
+        <span id="pipEpText">1</span>
+      </button>
+      <div class="pip-title" id="pipTitleText">TTV 播放器</div>
+      <div class="pip-actions">
+        <button class="pip-ic" id="pipPin" data-act="pin" title="置顶"></button>
+        <button class="pip-ic" id="pipTheme" data-act="theme" title="切换主题"></button>
+        <button class="pip-ic" id="pipRestore" data-act="restore-window" title="还原主窗口"></button>
+        <button class="pip-ic" id="pipClose" data-act="close" title="关闭"></button>
+      </div>
+    </div>
+
+    <div class="pip-center-transport" id="pipCenterTransport">
+      <button class="pip-tr-btn" id="pipPrev" data-act="prev" title="上一集"></button>
+      <button class="pip-tr-play" id="pipPlay" data-act="play" title="播放 / 暂停"></button>
+      <button class="pip-tr-btn" id="pipNext" data-act="next" title="下一集"></button>
+    </div>
+
+    <div class="pip-bottom-dock" id="pipBottomDock">
+      <div class="pip-scrub-slot" id="pipScrubSlot"></div>
+      <div class="pip-dock-row">
+        <div class="pip-time">
+          <span id="pipTimeCur">00:00</span>
+          <span class="pip-time-sep">/</span>
+          <span id="pipTimeDur">00:00</span>
+        </div>
+        <div class="pip-controls">
+          <button class="pip-ic pip-play-inline" id="pipPlayInline" data-act="play" title="播放 / 暂停"></button>
+          <button class="pip-ic pip-close-inline" id="pipCloseInline" data-act="close" title="关闭"></button>
+          <button class="pip-ic dm-toggle-btn" id="pipDm" data-act="dm-toggle" title="弹幕开关 (D)"></button>
+          <button class="pip-ic" id="pipVol" data-act="mute" title="静音 / 滚轮调音量"></button>
+          <button class="pip-rate-chip" id="pipRate" data-act="cycle-rate" title="切换倍速">1.0x</button>
+          <button class="pip-ic" id="pipRestoreBot" data-act="restore-window" title="还原主窗口"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Idle Mini Progress -->
+  <div class="mini-progress"><div class="mini-buf" id="miniBuf"></div><div class="mini-fill" id="miniFill"></div></div>
+
+  <!-- Center Episode Sheet -->
+  <div class="ep-sheet" id="epSheet">
+    <div class="ep-head">
+      <h3 id="epSheetTitle">选集列表</h3>
+      <input class="ep-search" id="epSearch" type="text" placeholder="输入集数回车跳转…" />
+    </div>
+    <div class="ep-grid" id="epGrid"></div>
+  </div>
+
+  <!-- Hold 3x Boost Pill -->
+  <div class="boost-pill" id="boostPill">▶▶ 3.0x 倍速快进中</div>
+
+  <!-- Autoplay Countdown Card -->
+  <div class="countdown-card" id="countdownCard">
+    <div>
+      <div class="countdown-title" id="cdTitle">即将播放下一集</div>
+      <div class="countdown-sub" id="cdSub">5 秒后自动连播</div>
+    </div>
+    <div class="countdown-actions">
+      <button class="cd-go" id="btnCdGo">立即播放</button>
+      <button class="cd-cancel" id="btnCdCancel">取消</button>
+    </div>
+  </div>
+
+  <!-- Center Toast -->
+  <div class="center-toast" id="centerToast">
+    <span class="toast-icon-badge" id="toastIcon"></span>
+    <span id="toastText"></span>
+  </div>
+
+  <!-- Shortcuts Modal -->
+  <div class="shortcut-modal" id="shortcutModal">
+    <div class="shortcut-box">
+      <div class="shortcut-head">
+        <span>播放器快捷键</span>
+        <button class="ic-btn" data-act="shortcuts" title="关闭">✕</button>
+      </div>
+      <div class="shortcut-grid">
+        <div class="sc-row"><span>播放 / 暂停</span><span class="kbd">Space</span></div>
+        <div class="sc-row"><span>全屏切换</span><span class="kbd">F / F11 / 双击</span></div>
+        <div class="sc-row"><span>快进 / 快退 10s</span><span class="kbd">→ / ←</span></div>
+        <div class="sc-row"><span>长按 3x 快进</span><span class="kbd">按住 →</span></div>
+        <div class="sc-row"><span>微调 ±5s</span><span class="kbd">L / J</span></div>
+        <div class="sc-row"><span>音量 ±5%</span><span class="kbd">↑ / ↓</span></div>
+        <div class="sc-row"><span>静音切换</span><span class="kbd">M</span></div>
+        <div class="sc-row"><span>开关光流补帧</span><span class="kbd">B</span></div>
+        <div class="sc-row"><span>画面比例模式</span><span class="kbd">V</span></div>
+        <div class="sc-row"><span>逐帧步进</span><span class="kbd">, / .</span></div>
+        <div class="sc-row"><span>A-B 区间循环</span><span class="kbd">[ / ]</span></div>
+        <div class="sc-row"><span>视频截图</span><span class="kbd">S</span></div>
+        <div class="sc-row"><span>上一集 / 下一集</span><span class="kbd">P / N</span></div>
+        <div class="sc-row"><span>选集列表</span><span class="kbd">E</span></div>
+        <div class="sc-row"><span>弹幕开关</span><span class="kbd">D</span></div>
+        <div class="sc-row"><span>自动连播</span><span class="kbd">A</span></div>
+        <div class="sc-row"><span>界面锁定 / 解锁</span><span class="kbd">H / Esc</span></div>
+        <div class="sc-row"><span>窗口置顶 / 性能</span><span class="kbd">K / I</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  const IC = {
+    back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>',
+    play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v14l11-7-11-7z"/></svg>',
+    pause: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>',
+    prev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 20L9 12l10-8v16z"/><line x1="5" y1="19" x2="5" y2="5"/></svg>',
+    next: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4l10 8-10 8V4z"/><line x1="19" y1="5" x2="19" y2="19"/></svg>',
+    back10: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>',
+    fwd10: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>',
+    vol: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>',
+    mute: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>',
+    tools: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>',
+    list: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="7" height="7" rx="1"/><rect x="14" y="4" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
+    full: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>',
+    unfull: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>',
+    kbd: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><line x1="6" y1="10" x2="6.01" y2="10"/><line x1="10" y1="10" x2="10.01" y2="10"/><line x1="14" y1="10" x2="14.01" y2="10"/><line x1="18" y1="10" x2="18.01" y2="10"/><line x1="7" y1="14" x2="17" y2="14"/></svg>',
+    wave: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
+    pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>',
+    sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32l1.41-1.41"/></svg>',
+    moon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',
+    min: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+    max: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>',
+    close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+    lockOpen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>',
+    lockClosed: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
+    spark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
+  };
+
+  function postHost(payload) {
+    if (window.chrome && window.chrome.webview) {
+      window.chrome.webview.postMessage(payload);
+    }
+  }
+
+  const state = {
+    theme: 'dark',
+    title: '正在加载…',
+    ep: 1,
+    totalEps: 1,
+    currentIndex: 0,
+    episodes: [],
+    paused: false,
+    buffering: true,
+    hasFrame: false,
+    pos: 0,
+    duration: 0,
+    bufferPos: 0,
+    volume: 100,
+    muted: false,
+    speed: 1.0,
+    fgEnabled: true,
+    fgMult: 2,
+    fgMode: 'auto',
+    outFps: 0,
+    srcFps: 25,
+    videoW: 0,
+    videoH: 0,
+    hwdec: '',
+    autoplay: true,
+    topmost: false,
+    fullscreen: false,
+    maximized: false,
+    pip: false,
+    locked: false,
+    osdOpen: false,
+    vsr: true,
+    vsrHwActive: false,
+    vsrHwSupported: false,
+    aspect: 'fit',
+    abA: null,
+    abB: null,
+    audioTracks: [],
+    audioTrackIdx: 0,
+    pic: { preset: 'orig', brightness: 0, contrast: 0, saturation: 0, gamma: 0 },
+    danmaku: {
+      enabled: true, region: 0.25, opacity: 1.0, fontScale: 1.0,
+      speedSec: 8.0, font: 'Microsoft YaHei', bold: true, color: '#ffffff', stroke: 'heavy',
+    },
+    danmakuItems: [],
+    idle: false,
+    openMenu: null,
+    drawerOpen: false,
+    shortcutsOpen: false,
+    searchQuery: '',
+    countdownActive: false,
+    countdownLeft: 0,
+    countdownTitle: '',
+    boostHold: false,
+  };
+
+  // DOM References
+  const frameEl = document.getElementById('playerFrame');
+  const stageEl = document.getElementById('videoStage');
+  const dmLayerEl = document.getElementById('danmakuLayer');
+  const scrubWrap = document.getElementById('scrubWrap');
+  const compactScrubRow = document.getElementById('compactScrubRow');
+  const mainDockRow = document.getElementById('mainDockRow');
+  const playedBar = document.getElementById('playedBar');
+  const bufBar = document.getElementById('bufBar');
+  const scrubThumb = document.getElementById('scrubThumb');
+  const scrubHint = document.getElementById('scrubHint');
+  const abRangeBar = document.getElementById('abRangeBar');
+  const miniBuf = document.getElementById('miniBuf');
+  const miniFill = document.getElementById('miniFill');
+
+  // Standalone Player Custom Monochrome Icons (Danmaku / PiP Restore)
+  IC.danmakuOn = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M7.5 10h6.5M16.5 10h.01M7.5 14h2.5M12.5 14h4"/></svg>`;
+  IC.danmakuOff = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5h9a3 3 0 0 1 3 3v8a3 3 0 0 1-.4 1.5"/><path d="M18.5 19H6a3 3 0 0 1-3-3V8a3 3 0 0 1 2.2-2.9"/><path d="M14 10h2.5M7.5 14h3.5"/><path d="M3 3l18 18"/></svg>`;
+  IC.restoreWin = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M14 15h4v4h-4z" opacity="0.45"/><path d="M13 14L8 9M8 13V9h4"/></svg>`;
+
+  // Initialize Static SVG Icons
+  const iconMap = {
+    btnHome: 'back', btnPrev: 'prev', btnBack10: 'back10', btnFwd10: 'fwd10',
+    btnNext: 'next', btnDanmaku: 'danmakuOn', btnTools: 'tools', btnDrawer: 'list',
+    btnShortcuts: 'kbd', btnOsd: 'wave', btnPin: 'pin', btnMin: 'min',
+    btnMax: 'max', btnClose: 'close',
+    pipPrev: 'prev', pipNext: 'next', pipPin: 'pin',
+    pipRestore: 'restoreWin', pipRestoreBot: 'restoreWin', pipClose: 'close', pipDm: 'danmakuOn',
+  };
+  for (const [id, k] of Object.entries(iconMap)) {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = IC[k];
+  }
+
+  // RollingNumber helper
+  function initRoller(el) {
+    el.className = 'roller';
+    el.dataset.val = '';
+  }
+  function setRoller(el, text) {
+    if (el.dataset.val === text) return;
+    const prev = el.dataset.val || '';
+    el.dataset.val = text;
+    if (prev.length !== text.length) {
+      el.innerHTML = '';
+      for (const ch of text) {
+        if (ch >= '0' && ch <= '9') {
+          const col = document.createElement('span');
+          col.className = 'roll-col';
+          const strip = document.createElement('span');
+          strip.className = 'roll-strip';
+          for (let d = 0; d <= 9; d++) {
+            const cell = document.createElement('span');
+            cell.textContent = String(d);
+            strip.appendChild(cell);
+          }
+          strip.style.transform = `translateY(${-Number(ch) * 18}px)`;
+          col.appendChild(strip);
+          el.appendChild(col);
+        } else {
+          const sp = document.createElement('span');
+          sp.className = 'roll-colon';
+          sp.textContent = ch;
+          el.appendChild(sp);
+        }
+      }
+      return;
+    }
+    const nodes = el.children;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (ch >= '0' && ch <= '9' && nodes[i]?.firstChild) {
+        nodes[i].firstChild.style.transform = `translateY(${-Number(ch) * 18}px)`;
+      }
+    }
+  }
+  function fmtTime(sec) {
+    const s = Math.max(0, Math.floor(sec || 0));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`;
+    return `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`;
+  }
+
+  const rollCur = document.getElementById('rollCur');
+  const rollDur = document.getElementById('rollDur');
+  initRoller(rollCur);
+  initRoller(rollDur);
+
+  // Toast Notification
+  let toastTimer = null;
+  function showToast(msg, iconHtml) {
+    const toast = document.getElementById('centerToast');
+    document.getElementById('toastIcon').innerHTML = iconHtml || IC.spark;
+    document.getElementById('toastText').textContent = msg;
+    toast.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.remove('show'), 1350);
+  }
+
+  // ===== Reliable Auto-Hide, Seek Anti-Snapback & Flyout Constraints =====
+  let lastActivityAt = performance.now();
+  let draggingScrub = false;
+  let scrubPointerId = null;
+  let lastScrubClientX = null;
+  let scrubPreviewSec = 0;
+  let draggingVol = false;
+  let activeRangeDrag = false;
+  let activePickerLock = false;
+  let menuHoverCloseTimer = null;
+  let cursorHiddenSent = false;
+  let latestSeekSeq = 0;
+  let pendingSeekPos = null;
+  let pendingSeekUntil = 0;
+  let loadingSeekDebounceUntil = 0;
+
+  function markPendingSeek(sec) {
+    latestSeekSeq += 1;
+    pendingSeekPos = sec;
+    const now = performance.now();
+    pendingSeekUntil = now + 2600;
+    loadingSeekDebounceUntil = now + 450;
+    return latestSeekSeq;
+  }
+
+  function shouldAcceptHostPos(pos, hostSeeking = false, hostSeekSeq = null) {
+    if (pendingSeekPos === null) return true;
+    if (typeof hostSeekSeq === 'number' && hostSeekSeq < latestSeekSeq) {
+      return false;
+    }
+    if (performance.now() >= pendingSeekUntil) {
+      pendingSeekPos = null;
+      pendingSeekUntil = 0;
+      return true;
+    }
+    if (hostSeeking === false && typeof hostSeekSeq === 'number' && hostSeekSeq >= latestSeekSeq) {
+      pendingSeekPos = null;
+      pendingSeekUntil = 0;
+      return true;
+    }
+    if (typeof hostSeekSeq !== 'number' && Math.abs(pos - pendingSeekPos) <= 1.25) {
+      pendingSeekPos = null;
+      pendingSeekUntil = 0;
+      return true;
+    }
+    return false;
+  }
+
+  function shouldShowLoadingPill() {
+    if (state.paused) return false;
+    if (!state.hasFrame) return true;
+    if (!state.buffering) return false;
+    return performance.now() >= loadingSeekDebounceUntil;
+  }
+
+  function setCursorHidden(hidden) {
+    if (cursorHiddenSent === hidden) return;
+    cursorHiddenSent = hidden;
+    frameEl.classList.toggle('cursor-hidden', hidden);
+    postHost({ cmd: 'cursorHidden', hidden });
+  }
+
+  function isInteractionHoldingHud() {
+    return (
+      state.paused ||
+      state.openMenu !== null ||
+      state.drawerOpen ||
+      state.shortcutsOpen ||
+      state.countdownActive ||
+      draggingScrub ||
+      draggingVol ||
+      activeRangeDrag ||
+      activePickerLock
+    );
+  }
+
+  function syncMiniProgressVisibility() {
+    const anyFloatingUiVisible =
+      !state.idle ||
+      state.openMenu !== null ||
+      state.drawerOpen ||
+      state.shortcutsOpen ||
+      state.countdownActive;
+    frameEl.classList.toggle('show-mini-progress', !anyFloatingUiVisible);
+  }
+
+  function wakeHud() {
+    lastActivityAt = performance.now();
+    if (state.idle) {
+      state.idle = false;
+      frameEl.classList.remove('is-idle');
+    }
+    syncMiniProgressVisibility();
+    setCursorHidden(false);
+  }
+
+  function scheduleHoverMenuClose(delayMs = 260) {
+    clearTimeout(menuHoverCloseTimer);
+    if (!state.openMenu) return;
+    if (draggingVol || activeRangeDrag || activePickerLock) return;
+    menuHoverCloseTimer = setTimeout(() => {
+      if (draggingVol || activeRangeDrag || activePickerLock) return;
+      if (state.openMenu) {
+        state.openMenu = null;
+        renderUI();
+      }
+    }, delayMs);
+  }
+
+  function cancelHoverMenuClose() {
+    clearTimeout(menuHoverCloseTimer);
+  }
+
+  setInterval(() => {
+    if (state.locked) {
+      const idleMs = performance.now() - lastActivityAt;
+      if (!state.idle && idleMs > 1600) {
+        state.idle = true;
+        frameEl.classList.add('is-idle');
+        syncMiniProgressVisibility();
+      }
+      setCursorHidden(false);
+      return;
+    }
+    if (isInteractionHoldingHud()) {
+      wakeHud();
+      return;
+    }
+    if (!state.idle && performance.now() - lastActivityAt > 2500) {
+      state.idle = true;
+      frameEl.classList.add('is-idle');
+      syncMiniProgressVisibility();
+      if (state.fullscreen) setCursorHidden(true);
+    }
+  }, 220);
+
+  let lastPointerX = -1;
+  let lastPointerY = -1;
+  let lastPointerInside = false;
+
+  document.addEventListener('pointerdown', (e) => {
+    document.documentElement.classList.remove('kbd-nav');
+    const active = document.activeElement;
+    if (active instanceof HTMLButtonElement && !e.target.closest('button')) {
+      active.blur();
+    }
+  }, { capture: true, passive: true });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      document.documentElement.classList.add('kbd-nav');
+    }
+  }, { capture: true, passive: true });
+  document.addEventListener('click', (e) => {
+    if (e.detail > 0) {
+      const btn = e.target?.closest?.('button');
+      if (btn instanceof HTMLElement) btn.blur();
+    }
+  }, { capture: true, passive: true });
+
+  document.addEventListener('pointermove', (e) => {
+    lastPointerX = e.clientX;
+    lastPointerY = e.clientY;
+    lastPointerInside = true;
+  }, { passive: true });
+  document.addEventListener('pointerleave', () => {
+    lastPointerInside = false;
+  }, { passive: true });
+
+  ['pointermove', 'pointerdown', 'keydown', 'wheel'].forEach((evName) => {
+    document.addEventListener(evName, wakeHud, { passive: true });
+  });
+
+  function clearActiveDragStates(commitScrub = false) {
+    if (draggingScrub) {
+      finishScrub(lastScrubClientX, commitScrub && lastScrubClientX !== null);
+    }
+    draggingVol = false;
+    activeRangeDrag = false;
+  }
+
+  // Hover-out auto-collapse on every menu scope ([data-menu-scope])
+  document.querySelectorAll('[data-menu-scope]').forEach((scope) => {
+    const name = scope.dataset.menuScope;
+    scope.addEventListener('mouseenter', () => {
+      cancelHoverMenuClose();
+      if (name === 'vol' && !state.locked && !state.drawerOpen && !state.shortcutsOpen) {
+        if (state.openMenu !== 'vol') {
+          state.openMenu = 'vol';
+          renderUI();
+        }
+      }
+    });
+    scope.addEventListener('mouseleave', () => {
+      if (state.openMenu === name) {
+        scheduleHoverMenuClose(260);
+      }
+    });
+  });
+
+  window.addEventListener('blur', () => {
+    activePickerLock = false;
+    clearActiveDragStates();
+    if (state.openMenu) {
+      state.openMenu = null;
+      renderUI();
+    }
+  });
+
+  // Track <input type="color"> picker inside menuTools so OS dialog doesn't close menu
+  const dmColorPicker = document.getElementById('dmColorPicker');
+  if (dmColorPicker) {
+    dmColorPicker.addEventListener('focus', () => { activePickerLock = true; cancelHoverMenuClose(); });
+    dmColorPicker.addEventListener('mousedown', () => { activePickerLock = true; cancelHoverMenuClose(); });
+    dmColorPicker.addEventListener('blur', () => { activePickerLock = false; });
+    dmColorPicker.addEventListener('change', () => { setTimeout(() => { activePickerLock = false; }, 120); });
+  }
+
+  const topChromeEl = document.getElementById('topChrome');
+  const bottomDockEl = document.getElementById('bottomDock');
+
+  // Transform-invariant resting layout box inside #playerFrame so .is-idle
+  // slide/scale transitions never skew flyout anchors or safe gaps.
+  function getLayoutBoxInFrame(el) {
+    if (!el || el.offsetWidth <= 0 || el.offsetHeight <= 0) return null;
+    let left = 0;
+    let top = 0;
+    let cur = el;
+    let hops = 0;
+    while (cur && cur !== frameEl && hops++ < 16) {
+      left += cur.offsetLeft || 0;
+      top += cur.offsetTop || 0;
+      cur = cur.offsetParent;
+    }
+    const width = el.offsetWidth;
+    const height = el.offsetHeight;
+    return { left, top, right: left + width, bottom: top + height, width, height };
+  }
+
+  let resizeSnapTimer = null;
+  let lastFrameSig = '';
+  function markResizingWindow() {
+    frameEl.classList.add('is-resizing');
+    clearTimeout(resizeSnapTimer);
+    resizeSnapTimer = setTimeout(() => {
+      frameEl.classList.remove('is-resizing');
+    }, 150);
+  }
+
+  // Dynamic flyout sizing & horizontal clamping (never collides with top islands or clips offscreen)
+  function syncMenuViewportConstraints() {
+    const vw = frameEl.clientWidth || window.innerWidth || 1280;
+    const vh = frameEl.clientHeight || window.innerHeight || 720;
+    frameEl.style.setProperty('--frame-w', `${vw}px`);
+    frameEl.style.setProperty('--frame-h', `${vh}px`);
+    const topBox = getLayoutBoxInFrame(topChromeEl);
+    const dockBox = getLayoutBoxInFrame(bottomDockEl);
+    const topSafe = Math.max(58, Math.ceil((topBox ? topBox.bottom : 52) + 10));
+    const flyBottomTarget = (dockBox ? Math.floor(dockBox.top) : vh - 76) - 10;
+    const availH = Math.max(120, flyBottomTarget - topSafe);
+    frameEl.style.setProperty('--flyout-max-h', `${availH}px`);
+    frameEl.classList.toggle('is-tools-single', vw < 660 || vh < 440);
+
+    ['menuTools', 'menuRate', 'menuFg', 'menuVol'].forEach((id) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const sr = getLayoutBoxInFrame(el.parentElement);
+      if (!sr) return;
+      const bottomGap = Math.max(12, Math.round(sr.top - flyBottomTarget));
+      el.style.bottom = `calc(100% + ${bottomGap}px)`;
+      el.style.setProperty('--flyout-bridge-h', `${bottomGap + 6}px`);
+
+      const fw = Math.min(el.offsetWidth || (id === 'menuVol' ? 46 : 200), vw - 28);
+      let shiftX = 0;
+      if (id === 'menuVol') {
+        const centerX = (sr.left + sr.right) / 2;
+        const naturalLeft = centerX - fw / 2;
+        const naturalRight = centerX + fw / 2;
+        if (naturalLeft < 14) {
+          shiftX = 14 - naturalLeft;
+        } else if (naturalRight > vw - 14) {
+          shiftX = (vw - 14) - naturalRight;
+        }
+      } else {
+        const naturalLeft = sr.right - fw;
+        if (naturalLeft < 14) {
+          shiftX = Math.min(vw - 14 - sr.right, 14 - naturalLeft);
+        } else if (sr.right > vw - 14) {
+          shiftX = (vw - 14) - sr.right;
+        }
+      }
+      el.style.setProperty('--flyout-shift-x', `${Math.round(shiftX)}px`);
+    });
+  }
+
+  // Video Rect Reporting (DirectComposition sub-viewport sync)
+  let lastVideoRectJson = '';
+  let hostTargetCss = null;
+  let hostSettleRaf = 0;
+  let hostSettleTimer = null;
+  let hostSettleAttempts = 0;
+
+  function syncHoverAfterResize() {
+    if (state.openMenu !== 'vol' || draggingVol || activeRangeDrag || !lastPointerInside) return;
+    if (lastPointerX < 0 || lastPointerY < 0) return;
+    const hit = document.elementFromPoint(lastPointerX, lastPointerY);
+    if (!hit || !hit.closest('[data-menu-scope="vol"]')) {
+      state.openMenu = null;
+      renderUI();
+    }
+  }
+
+  function syncVideoRect() {
+    const r = stageEl.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const wCss = Math.max(1, frameEl.clientWidth || r.width || window.innerWidth || 1280);
+    const hCss = Math.max(1, frameEl.clientHeight || r.height || window.innerHeight || 720);
+    const frameSig = `${wCss}x${hCss}@${dpr.toFixed(3)}`;
+    if (lastFrameSig && lastFrameSig !== frameSig) {
+      markResizingWindow();
+    }
+    lastFrameSig = frameSig;
+
+    const x = Math.round(r.left * dpr);
+    const y = Math.round(r.top * dpr);
+    const w = Math.max(1, Math.round(wCss * dpr));
+    const h = Math.max(1, Math.round(hCss * dpr));
+    const sig = `${x},${y},${w},${h}`;
+    if (sig !== lastVideoRectJson) {
+      lastVideoRectJson = sig;
+      postHost({ cmd: 'videoRect', x, y, w, h });
+    }
+    updateResponsiveLayout(wCss, hCss);
+    syncMenuViewportConstraints();
+  }
+
+  function scheduleHostResizeSettle() {
+    cancelAnimationFrame(hostSettleRaf);
+    clearTimeout(hostSettleTimer);
+    const step = () => {
+      syncVideoRect();
+      const curW = frameEl.clientWidth || window.innerWidth || 0;
+      const curH = frameEl.clientHeight || window.innerHeight || 0;
+      const settled = !hostTargetCss
+        || (Math.abs(curW - hostTargetCss.w) <= 1.5 && Math.abs(curH - hostTargetCss.h) <= 1.5);
+      if (settled) {
+        clearTimeout(hostSettleTimer);
+        syncHoverAfterResize();
+        return;
+      }
+      if (++hostSettleAttempts < 8) {
+        hostSettleRaf = requestAnimationFrame(step);
+        hostSettleTimer = setTimeout(() => {
+          syncVideoRect();
+          syncHoverAfterResize();
+        }, 48);
+      } else {
+        syncHoverAfterResize();
+      }
+    };
+    hostSettleAttempts = 0;
+    hostSettleRaf = requestAnimationFrame(step);
+  }
+
+  function formatVideoAspectTag(vw, vh) {
+    if (!vw || !vh) return '';
+    const r = vw / vh;
+    if (Math.abs(r - (16 / 9)) < 0.08) return '16:9 横屏';
+    if (Math.abs(r - (9 / 16)) < 0.05) return '9:16 竖屏';
+    if (Math.abs(r - (4 / 3)) < 0.06) return '4:3';
+    if (Math.abs(r - 1) < 0.06) return '1:1 方屏';
+    return r >= 1 ? `${r.toFixed(2)}:1` : `1:${(1 / r).toFixed(2)}`;
+  }
+
+  function updateResponsiveLayout(cssWidth, cssHeight) {
+    const w = cssWidth || frameEl.clientWidth || window.innerWidth || 1280;
+    const h = cssHeight || frameEl.clientHeight || window.innerHeight || 720;
+    const isPip = !state.fullscreen && (state.pip || w < 440 || h < 280);
+    const isPipTiny = isPip && (w < 300 || h < 205);
+    const aspect = w / Math.max(h, 1);
+    const compact = !isPip && (w < 780 || (w < 860 && aspect < 1.48));
+    const narrow = !isPip && w < 580;
+    const ultra = !isPip && w < 330;
+    const isVideoPortrait = (state.videoW > 0 && state.videoH > 0)
+      ? (state.videoH > state.videoW * 1.04)
+      : (h > w * 1.12);
+    const isTallWindow = h > w * 1.10;
+    const isPortraitFullscreen = state.fullscreen && isVideoPortrait && aspect > 1.15;
+
+    const prevCompact = frameEl.classList.contains('is-compact');
+    const prevPip = frameEl.classList.contains('is-pip');
+    frameEl.classList.toggle('is-pip', isPip);
+    frameEl.classList.toggle('is-pip-tiny', isPipTiny);
+    frameEl.classList.toggle('is-compact', compact);
+    frameEl.classList.toggle('is-narrow', narrow);
+    frameEl.classList.toggle('is-ultra-narrow', ultra);
+    frameEl.classList.toggle('is-portrait', isVideoPortrait);
+    frameEl.classList.toggle('is-landscape', !isVideoPortrait);
+    frameEl.classList.toggle('is-tall-window', isTallWindow);
+    frameEl.classList.toggle('is-portrait-fullscreen', isPortraitFullscreen);
+    // Move shared scrub bar cleanly among PiP bottom slot, compact top row, and desktop inline slot
+    const pipScrubSlot = document.getElementById('pipScrubSlot');
+    if (isPip && pipScrubSlot) {
+      if (scrubWrap.parentElement !== pipScrubSlot) {
+        pipScrubSlot.appendChild(scrubWrap);
+      }
+    } else if (compact && scrubWrap.parentElement !== compactScrubRow) {
+      compactScrubRow.appendChild(scrubWrap);
+    } else if (!compact && !isPip && scrubWrap.parentElement !== mainDockRow) {
+      mainDockRow.insertBefore(scrubWrap, mainDockRow.children[1]);
+    }
+    let menuClosed = false;
+    if (isPip && state.openMenu) {
+      state.openMenu = null;
+      menuClosed = true;
+    }
+    if (narrow && state.openMenu === 'rate') {
+      state.openMenu = null;
+      menuClosed = true;
+    }
+    if (ultra && (state.openMenu === 'fg' || state.openMenu === 'vol' || state.openMenu === 'rate')) {
+      state.openMenu = null;
+      menuClosed = true;
+    }
+    if (menuClosed) {
+      document.getElementById('menuTools')?.classList.remove('open');
+      document.getElementById('menuRate')?.classList.remove('open');
+      document.getElementById('menuFg')?.classList.remove('open');
+      document.getElementById('menuVol')?.classList.remove('open');
+    }
+    if (prevCompact !== compact || prevPip !== isPip) {
+      syncMenuViewportConstraints();
+    }
+  }
+
+  const layoutObserver = new ResizeObserver((entries) => {
+    let frameChanged = false;
+    for (const entry of entries) {
+      if (entry.target === frameEl || entry.target === document.documentElement || entry.target === stageEl) {
+        frameChanged = true;
+        break;
+      }
+    }
+    if (frameChanged) {
+      syncVideoRect();
+    } else {
+      syncMenuViewportConstraints();
+    }
+  });
+  layoutObserver.observe(document.documentElement);
+  layoutObserver.observe(frameEl);
+  layoutObserver.observe(stageEl);
+  layoutObserver.observe(topChromeEl);
+  layoutObserver.observe(bottomDockEl);
+  window.addEventListener('resize', () => {
+    markResizingWindow();
+    syncVideoRect();
+    syncHoverAfterResize();
+  });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', () => {
+      markResizingWindow();
+      syncVideoRect();
+    });
+  }
+
+  function formatDisplayTitle(raw) {
+    const s = String(raw || '').trim();
+    if (!s) return 'TTV Player';
+    const looksLikeFilePath =
+      /^[a-zA-Z]:[\\/]/.test(s) ||
+      /^\\\\/.test(s) ||
+      (/^\/[^/]/.test(s) && /\.(mp4|mkv|webm|mov|m3u8|ts|flv|avi)$/i.test(s));
+    if (!looksLikeFilePath) return s;
+    const base = s.split(/[\\/]/).filter(Boolean).pop() || s;
+    const stripped = base.replace(/\.(mp4|mkv|webm|mov|m3u8|ts|flv|avi)$/i, '');
+    return stripped || base;
+  }
+
+  function syncCrystalRangeVisual(inp) {
+    if (!inp) return;
+    const min = Number(inp.min ?? 0);
+    const max = Number(inp.max ?? 100);
+    const val = Number(inp.value ?? min);
+    const span = Math.max(0.0001, max - min);
+    const pct = Math.min(100, Math.max(0, ((val - min) / span) * 100));
+    if (min < 0 && max > 0) {
+      const zeroPct = ((-min) / span) * 100;
+      const start = Math.min(zeroPct, pct);
+      const end = Math.max(zeroPct, pct);
+      inp.style.setProperty('--fill-start', `${start.toFixed(2)}%`);
+      inp.style.setProperty('--fill-end', `${end.toFixed(2)}%`);
+    } else {
+      inp.style.setProperty('--fill-start', '0%');
+      inp.style.setProperty('--fill-end', `${pct.toFixed(2)}%`);
+    }
+  }
+
+  // ===== UI Render Synchronization =====
+  function renderUI() {
+    document.body.dataset.theme = state.theme;
+    frameEl.classList.toggle('is-locked', state.locked);
+
+    const rawTitle = state.title || 'TTV Player';
+    const titleEl = document.getElementById('titleText');
+    titleEl.textContent = formatDisplayTitle(rawTitle);
+    const dragAreaEl = document.getElementById('dragArea');
+    if (dragAreaEl) dragAreaEl.title = rawTitle;
+    const epTxt = state.totalEps > 1 ? `第 ${state.ep}/${state.totalEps} 集` : `第 ${state.ep} 集`;
+    document.getElementById('epBadge').textContent = epTxt;
+
+    document.getElementById('btnPlay').innerHTML = state.paused ? IC.play : IC.pause;
+    const muted = state.muted || state.volume <= 0;
+    document.getElementById('btnVol').innerHTML = muted ? IC.mute : IC.vol;
+    document.getElementById('btnFull').innerHTML = state.fullscreen ? IC.unfull : IC.full;
+    document.getElementById('btnLock').innerHTML = state.locked ? IC.lockClosed : IC.lockOpen;
+    document.getElementById('btnThemeSwitch').innerHTML = state.theme === 'dark' ? IC.sun : IC.moon;
+    const btnDanmakuEl = document.getElementById('btnDanmaku');
+    if (btnDanmakuEl) {
+      btnDanmakuEl.innerHTML = state.danmaku.enabled ? IC.danmakuOn : IC.danmakuOff;
+      btnDanmakuEl.classList.toggle('is-on', state.danmaku.enabled);
+      btnDanmakuEl.classList.toggle('is-active', state.danmaku.enabled);
+      btnDanmakuEl.title = state.danmaku.enabled ? '关闭弹幕 (D)' : '开启弹幕 (D)';
+    }
+
+    // Mini / PiP HUD Sync
+    const pipTitleEl = document.getElementById('pipTitleText');
+    if (pipTitleEl) {
+      pipTitleEl.textContent = formatDisplayTitle(rawTitle);
+      pipTitleEl.title = rawTitle;
+    }
+    const pipEpTextEl = document.getElementById('pipEpText');
+    if (pipEpTextEl) {
+      pipEpTextEl.textContent = state.totalEps > 1 ? `${state.ep}/${state.totalEps}` : `E${state.ep}`;
+    }
+    const pipPlayEl = document.getElementById('pipPlay');
+    if (pipPlayEl) pipPlayEl.innerHTML = state.paused ? IC.play : IC.pause;
+    const pipPlayInlineEl = document.getElementById('pipPlayInline');
+    if (pipPlayInlineEl) pipPlayInlineEl.innerHTML = state.paused ? IC.play : IC.pause;
+    const pipPrevEl = document.getElementById('pipPrev');
+    if (pipPrevEl) pipPrevEl.disabled = state.currentIndex <= 0 && state.ep <= 1;
+    const pipNextEl = document.getElementById('pipNext');
+    if (pipNextEl) pipNextEl.disabled = state.totalEps > 0 && state.ep >= state.totalEps;
+    document.getElementById('pipPin')?.classList.toggle('is-active', state.topmost);
+    const pipThemeEl = document.getElementById('pipTheme');
+    if (pipThemeEl) pipThemeEl.innerHTML = state.theme === 'dark' ? IC.sun : IC.moon;
+    const pipVolEl = document.getElementById('pipVol');
+    if (pipVolEl) {
+      pipVolEl.innerHTML = muted ? IC.mute : IC.vol;
+      pipVolEl.title = muted ? '已静音 (点击恢复)' : `音量 ${Math.round(state.volume)}% (滚轮可调)`;
+    }
+    const pipDmEl = document.getElementById('pipDm');
+    if (pipDmEl) {
+      pipDmEl.innerHTML = state.danmaku.enabled ? IC.danmakuOn : IC.danmakuOff;
+      pipDmEl.classList.toggle('is-on', state.danmaku.enabled);
+      pipDmEl.title = state.danmaku.enabled ? '关闭弹幕 (D)' : '开启弹幕 (D)';
+    }
+    const pipRateEl = document.getElementById('pipRate');
+    if (pipRateEl) pipRateEl.textContent = `${Number(state.speed.toFixed(2))}x`;
+
+    document.getElementById('btnAutoplay').classList.toggle('is-active', state.autoplay);
+    document.getElementById('btnOsd').classList.toggle('is-active', state.osdOpen);
+    document.getElementById('btnPin').classList.toggle('is-active', state.topmost);
+    document.getElementById('btnPinTools')?.classList.toggle('is-active', state.topmost);
+    updateResponsiveLayout();
+
+    // Menus & Panels
+    syncMenuViewportConstraints();
+    const menus = { vol: 'menuVol', rate: 'menuRate', fg: 'menuFg', tools: 'menuTools' };
+    for (const [k, elId] of Object.entries(menus)) {
+      const el = document.getElementById(elId);
+      el?.classList.toggle('open', state.openMenu === k && !state.locked);
+    }
+    document.getElementById('btnRate').classList.toggle('is-active', state.openMenu === 'rate');
+    document.getElementById('btnFg').classList.toggle('is-active', state.fgEnabled || state.openMenu === 'fg');
+    document.getElementById('btnTools').classList.toggle('is-active', state.openMenu === 'tools');
+    document.getElementById('btnDrawer').classList.toggle('is-active', state.drawerOpen);
+
+    document.getElementById('epSheet').classList.toggle('open', state.drawerOpen && !state.locked);
+    document.getElementById('shortcutModal').classList.toggle('open', state.shortcutsOpen && !state.locked);
+    document.getElementById('osdCard').classList.toggle('show', state.osdOpen);
+
+    const anyCenterOverlay = state.openMenu === 'tools' || state.drawerOpen || state.shortcutsOpen;
+    document.getElementById('btnLock').classList.toggle('hidden-for-panel', anyCenterOverlay && !state.locked);
+
+    // Rate & FG badges
+    document.getElementById('btnRate').textContent = `${Number(state.speed.toFixed(2))}x`;
+    document.querySelectorAll('#menuRate .menu-opt').forEach((el) => {
+      el.classList.toggle('is-active', Math.abs(Number(el.dataset.val) - state.speed) < 0.01);
+    });
+    const fgVal = state.fgEnabled ? state.fgMult : -1;
+    const fgBadge = !state.fgEnabled
+      ? '补帧 关'
+      : (state.fgMult > 0 ? `补帧 ${state.fgMult}X` : '补帧 自动');
+    document.getElementById('fgBtnLabel').textContent = fgBadge;
+    document.querySelectorAll('#menuFg .menu-opt').forEach((el) => {
+      const optVal = Number(el.dataset.val);
+      el.classList.toggle('is-active', (!state.fgEnabled && optVal === 0) || (state.fgEnabled && optVal === state.fgMult));
+    });
+    document.querySelectorAll('#menuFg .seg-pill').forEach((el) => {
+      el.classList.toggle('is-active', el.dataset.val === state.fgMode);
+    });
+    const hzText = state.outFps > 1
+      ? `${Math.round(state.outFps)} Hz`
+      : (state.fgMult > 0 ? `${Math.round(state.srcFps * (state.fgEnabled ? state.fgMult : 1))} Hz` : '自动 Hz');
+    document.getElementById('fgFpsMini').textContent = state.fgEnabled ? hzText : '原生';
+
+    // Volume Bubble
+    const vp = Math.round(state.volume);
+    const vPct = Math.min(100, Math.max(0, (vp / 130) * 100));
+    const volPctEl = document.getElementById('volPctLabel');
+    volPctEl.textContent = `${vp}%`;
+    volPctEl.classList.toggle('is-boost', vp > 100);
+    document.getElementById('volFill').style.height = `${vPct}%`;
+    document.getElementById('volThumb').style.bottom = `${vPct}%`;
+
+    // Loading Pill (debounced against seek jitter)
+    document.getElementById('loadingPill').classList.toggle('show', shouldShowLoadingPill());
+    document.getElementById('loadingText').textContent = state.hasFrame ? '缓冲中…' : '正在加载视频流…';
+
+    // Boost Pill & Countdown Card
+    document.getElementById('boostPill').classList.toggle('show', state.boostHold);
+    const cdCard = document.getElementById('countdownCard');
+    cdCard.classList.toggle('show', state.countdownActive);
+    if (state.countdownActive) {
+      document.getElementById('cdTitle').textContent = state.countdownTitle || '即将播放下一集';
+      document.getElementById('cdSub').textContent = `${Math.max(1, Math.ceil(state.countdownLeft))} 秒后自动连播`;
+    }
+
+    // Tools Panel Sync
+    const aspectNames = { fit: '适应', cover: '裁剪', stretch: '拉伸' };
+    const picPresetNames = { orig: '原色', vivid: '影院', eye: '护眼', night: '夜间', custom: '自定义' };
+    const aspectTag = formatVideoAspectTag(state.videoW, state.videoH);
+    document.getElementById('aspectLabel').textContent = aspectNames[state.aspect] || '适应';
+    document.getElementById('toolsSummary').textContent =
+      `${aspectTag ? aspectTag + ' · ' : ''}${picPresetNames[state.pic.preset] || '原色'} · ${aspectNames[state.aspect] || '适应'}`;
+
+    document.querySelectorAll('#menuTools .preset-btn').forEach((el) => {
+      el.classList.toggle('is-active', el.dataset.val === state.pic.preset);
+    });
+    document.querySelectorAll('#menuTools [data-act="rate"]').forEach((el) => {
+      el.classList.toggle('is-active', Math.abs(Number(el.dataset.val) - state.speed) < 0.01);
+    });
+    document.querySelectorAll('#menuTools [data-tune]').forEach((inp) => {
+      const k = inp.dataset.tune;
+      const v = state.pic[k] ?? 0;
+      if (document.activeElement !== inp) inp.value = String(v);
+      syncCrystalRangeVisual(inp);
+    });
+    document.getElementById('valBrightness').textContent = fmtSigned(state.pic.brightness);
+    document.getElementById('valContrast').textContent = fmtSigned(state.pic.contrast);
+    document.getElementById('valSaturation').textContent = fmtSigned(state.pic.saturation);
+    document.getElementById('valGamma').textContent = fmtSigned(state.pic.gamma);
+
+    document.querySelectorAll('#menuTools [data-act="aspect"]').forEach((el) => {
+      el.classList.toggle('is-active', el.dataset.val === state.aspect);
+    });
+    document.getElementById('vsrToggle').checked = !!state.vsr;
+    const vsrLabel = document.getElementById('vsrLabel');
+    if (vsrLabel) {
+      vsrLabel.textContent = !state.vsr
+        ? 'RTX VSR 超分增强'
+        : (state.vsrHwActive ? 'RTX VSR 硬件超分 · 运行中' : 'GPU 超分增强 · 运行中');
+    }
+    document.getElementById('btnPip').textContent = state.pip ? '小窗预览 开' : '小窗预览 关';
+    document.getElementById('btnPip').classList.toggle('is-active', state.pip);
+
+    // Danmaku Tools Sync
+    document.getElementById('dmToggle').checked = !!state.danmaku.enabled;
+    const regPct = Math.round(state.danmaku.region * 100);
+    const opPct = Math.round(state.danmaku.opacity * 100);
+    const fsPct = Math.round(state.danmaku.fontScale * 100);
+    setRangeIfIdle('[data-dm-range="region"]', regPct);
+    setRangeIfIdle('[data-dm-range="opacity"]', opPct);
+    setRangeIfIdle('[data-dm-range="fontScale"]', fsPct);
+    setRangeIfIdle('[data-dm-range="speedSec"]', Math.round(state.danmaku.speedSec));
+    document.getElementById('valDmRegion').textContent = `${regPct}%`;
+    document.getElementById('valDmOpacity').textContent = `${opPct}%`;
+    document.getElementById('valDmFontScale').textContent = `${fsPct}%`;
+    document.getElementById('valDmSpeed').textContent = dmSpeedLabel(state.danmaku.speedSec);
+    document.querySelectorAll('#menuTools [data-dm-range]').forEach((inp) => syncCrystalRangeVisual(inp));
+    const curFont = state.danmaku.font || 'Microsoft YaHei';
+    document.querySelectorAll('#menuTools [data-act="dm-font"]').forEach((el) => {
+      el.classList.toggle('is-active', el.dataset.val === curFont);
+    });
+    const dmBoldBtn = document.getElementById('dmBoldBtn');
+    if (dmBoldBtn) {
+      const boldOn = !!state.danmaku.bold;
+      dmBoldBtn.classList.toggle('is-active', boldOn);
+      dmBoldBtn.setAttribute('aria-pressed', boldOn ? 'true' : 'false');
+    }
+    if (dmColorPicker && document.activeElement !== dmColorPicker) {
+      dmColorPicker.value = /^#[0-9a-f]{6}$/i.test(state.danmaku.color || '') ? state.danmaku.color : '#ffffff';
+    }
+    document.querySelectorAll('#dmSwatches .dm-swatch').forEach((s) => {
+      s.classList.toggle('is-active', (s.dataset.color || '').toLowerCase() === (state.danmaku.color || '').toLowerCase());
+    });
+    document.querySelectorAll('#menuTools [data-act="dm-stroke"]').forEach((el) => {
+      el.classList.toggle('is-active', el.dataset.val === state.danmaku.stroke);
+    });
+
+    // Audio Track Button
+    const curAudio = state.audioTracks.find((t) => t.selected) || state.audioTracks[state.audioTrackIdx];
+    document.getElementById('btnAudioTrack').textContent = curAudio
+      ? `音轨: ${curAudio.title || curAudio.lang || '#' + curAudio.id}`
+      : '音轨: 默认';
+
+    // AB Loop Button
+    const abBtn = document.getElementById('btnAbLoop');
+    if (state.abA !== null && state.abB !== null) {
+      abBtn.textContent = `A-B 循环 (${fmtTime(state.abA)} → ${fmtTime(state.abB)})`;
+      abBtn.classList.add('is-active');
+    } else if (state.abA !== null) {
+      abBtn.textContent = `A 点已标记 ${fmtTime(state.abA)} · 再按设 B 点`;
+      abBtn.classList.add('is-active');
+    } else {
+      abBtn.textContent = 'A-B 循环 (标记 A 点)';
+      abBtn.classList.remove('is-active');
+    }
+
+    // OSD Telemetry
+    if (state.osdOpen) {
+      document.getElementById('osdHwdec').textContent = state.hwdec || 'd3d11va';
+      document.getElementById('osdSrcFps').textContent = `${state.srcFps.toFixed(1)} fps`;
+      document.getElementById('osdOutFps').textContent = state.outFps > 1 ? `${state.outFps.toFixed(1)} fps` : '—';
+      document.getElementById('osdFgState').textContent = state.fgEnabled
+        ? `${state.fgMult > 0 ? state.fgMult + 'X' : '自动'} (${state.fgMode})`
+        : '关闭';
+      const osdTag = formatVideoAspectTag(state.videoW, state.videoH);
+      document.getElementById('osdRes').textContent = state.videoW > 0
+        ? `${state.videoW}×${state.videoH}${osdTag ? ' · ' + osdTag : ''}`
+        : '—';
+    }
+    updateProgressUI();
+    syncMiniProgressVisibility();
+  }
+
+  function setRangeIfIdle(sel, val) {
+    const el = document.querySelector(sel);
+    if (el && document.activeElement !== el) el.value = String(val);
+  }
+  function fmtSigned(v) { return v > 0 ? `+${v}` : String(v || 0); }
+  function dmSpeedLabel(sec) {
+    if (sec <= 6) return '极快';
+    if (sec <= 7.5) return '较快';
+    if (sec <= 9.5) return '适中';
+    return '舒缓';
+  }
+
+  function updateProgressUI() {
+    const dur = Math.max(0.01, state.duration || 1);
+    const displayPos = draggingScrub ? scrubPreviewSec : state.pos;
+    const ratio = state.duration > 0 ? Math.min(1, Math.max(0, displayPos / dur)) : 0;
+    const pipTimeCur = document.getElementById('pipTimeCur');
+    const pipTimeDur = document.getElementById('pipTimeDur');
+    if (pipTimeCur) pipTimeCur.textContent = fmtTime(displayPos);
+    if (pipTimeDur) pipTimeDur.textContent = fmtTime(state.duration);
+    const pct = `${(ratio * 100).toFixed(2)}%`;
+    playedBar.style.width = pct;
+    scrubThumb.style.left = pct;
+    miniFill.style.width = pct;
+    const bufRatio = state.duration > 0 ? Math.min(1, Math.max(ratio, state.bufferPos / dur)) : 0;
+    const bufPct = `${(bufRatio * 100).toFixed(2)}%`;
+    bufBar.style.width = bufPct;
+    if (miniBuf) miniBuf.style.width = bufPct;
+
+    if (state.abA !== null && state.abB !== null && state.duration > 0) {
+      const aPct = Math.min(100, Math.max(0, (state.abA / dur) * 100));
+      const bPct = Math.min(100, Math.max(aPct, (state.abB / dur) * 100));
+      abRangeBar.style.left = `${aPct}%`;
+      abRangeBar.style.width = `${bPct - aPct}%`;
+      abRangeBar.classList.add('show');
+    } else {
+      abRangeBar.classList.remove('show');
+    }
+
+    setRoller(rollCur, fmtTime(displayPos));
+    setRoller(rollDur, fmtTime(state.duration));
+  }
+
+  function renderEpisodeSheet() {
+    const grid = document.getElementById('epGrid');
+    const count = Math.max(state.totalEps || 0, state.episodes.length, state.ep || 1);
+    document.getElementById('epSheetTitle').textContent = `全部剧集 (${count})`;
+    const q = state.searchQuery.trim();
+    const frag = document.createDocumentFragment();
+    let currentBtn = null;
+    for (let i = 0; i < count; i++) {
+      const epNum = i + 1;
+      if (q && !String(epNum).includes(q)) continue;
+      const btn = document.createElement('button');
+      const isCur = i === state.currentIndex || epNum === state.ep;
+      btn.className = 'ep-cell' + (isCur ? ' is-current' : '');
+      btn.textContent = `${epNum}`;
+      btn.dataset.act = 'ep';
+      btn.dataset.val = String(i);
+      if (isCur && !currentBtn) currentBtn = btn;
+      frag.appendChild(btn);
+    }
+    grid.innerHTML = '';
+    grid.appendChild(frag);
+    if (currentBtn && state.drawerOpen && !q) {
+      requestAnimationFrame(() => currentBtn.scrollIntoView({ block: 'center', behavior: 'instant' }));
+    }
+  }
+
+  // ===== Hongguo Complete Emote Map (synced from src/services/danmakuEmoji.ts) =====
+  const EMOTE_PATTERN = /\[([^\[\]]{1,10})\]/g;
+  const EMOTE_MAP = {
+    // 红果官方 v5 表情编码 (2026-10 实采 53 枚)
+    '微笑': '😊', '偷笑': '🤭', '笑': '😄', '什么': '😳',
+    '害羞': '🥰', '爱慕': '😍', '飞吻': '😘', '奸笑': '😏',
+    '尬笑': '😅', '思考': '🤔', '撇嘴': '😒', '做鬼脸': '🤪',
+    '酷': '😎', '翻白眼': '🙄', '惊呆': '😲', '震惊': '😱',
+    '送心': '💕', '委屈': '🥺', '快哭了': '😢', '笑哭': '😂',
+    '哭': '😭', '大笑': '🤣', '舔屏': '🤤', '怒': '😡',
+    '捂脸': '🤦', '吐': '🤮', '恐惧': '😨', '抓狂': '🤯',
+    '敬礼': '🫡', '石化': '🗿', 'OK': '👌', 'ok': '👌',
+    '赞': '👍', '爱心': '❤️', '伤心': '💔', 'KISS': '💋',
+    'kiss': '💋', '懂了': '👀', '探究': '🧐', '重拳出击': '👊',
+    '吃瓜': '🍉', '盯': '👁️', '你细品': '🫣', '赶稿中': '✍️',
+    '注意': '⚠️', '饱了': '🫃', '码住': '📌', '学会了': '✅',
+    '顶帖': '🔝', '求爆更': '🔥', '求关注': '🙏', '爽': '😆',
+    '鼓掌': '👏', '没看够': '🥹', '送花': '🌹',
+
+    // 专属表情包别名 / 老版本编码 (guoapp)
+    '色': '😍', '得意': '😏', '调皮': '😜', '尴尬': '😅',
+    '呲牙': '😁', '哈哈': '😄', '可怜': '🥺', '流泪': '😢',
+    '大哭': '😭', '惊恐': '😱', '发怒': '😡', '抓狂': '😫',
+    '发呆': '😐', '疑问': '❓', '打call': '📣', '加油': '💪',
+    '冲鸭': '🦆', '比心': '🫶', '握手': '🤝', '抱抱': '🤗',
+    '玫瑰': '🌹', '花花': '💐', '强': '👍', '棒': '👍',
+    '爱你': '❤️', '心心': '💕', '笑死': '😂', '绝了': '👏',
+    '666': '🔥', 'yyds': '👑', 'YYDS': '👑', 'awsl': '💘',
+    'AWSL': '💘', '吃糖': '🍬', '磕到了': '💘', '甜': '🍯',
+    '上头': '🥰', '狗头': '🐶', 'doge': '🐶', 'Doge': '🐶',
+
+    // 扩展近义编码 (通用弹幕库高频覆盖)
+    '破涕为笑': '😂', '狂笑': '🤣', '坏笑': '😏', '阴险': '😏',
+    '斜眼笑': '😏', '憨笑': '😅', '苦笑': '😅', '痴笑': '🥰',
+    '姨母笑': '🥰', '花痴': '😍', '犯花痴': '😍', '馋': '🤤',
+    '滑稽': '😜', '吐舌': '😛', '鬼脸': '😜', '开心': '😄',
+    '高兴': '😊', '愉快': '😊', '满意': '😌', '满足': '😌',
+    '期待': '🤩', '星星眼': '🤩', '崇拜': '🤩', '羡慕': '🥹',
+    '感动': '🥹', '泪目': '🥹', '泪奔': '😭', '爆哭': '😭',
+    '痛哭': '😭', '呜呜': '😭', '哭死': '😭', '伤心欲绝': '💔',
+    '心碎': '💔', '难过': '😔', '失落': '😞', '郁闷': '😞',
+    '无语': '😑', '沉默': '😶', '白眼': '🙄', '鄙视': '😒',
+    '嫌弃': '😒', '吃惊': '😲', '惊讶': '😮', '哇塞': '😮',
+    '震撼': '🤯', '炸裂': '🤯', '崩溃': '🤯', '头大': '🤯',
+    '害臊': '😳', '脸红': '😳', '社死': '😳', '晕': '😵',
+    '呆': '😶', '发懵': '😵', '懵逼': '😵', '吓死': '😱',
+    '害怕': '😨', '瑟瑟发抖': '🥶', '冷汗': '😰', '擦汗': '😓',
+    '尴尬笑': '😅', '汗': '💦', '生气': '😠', '愤怒': '🤬',
+    '暴怒': '🤬', '哼': '😤', '傲娇': '😤', '委屈屈': '🥺',
+    '求求了': '🙏', '拜托': '🙏', '磕头': '🙇', '点赞': '👍',
+    '点个赞': '👍', '太棒了': '👏', '牛': '🐮', '厉害': '💪',
+    '冲': '🔥', '燃': '🔥', '着火': '🔥', '炸': '💣',
+    '玫瑰花': '🌹', '小红花': '🌺', '鲜花': '💐', '花': '🌸',
+    '心': '❤️', '红心': '❤️', '双心': '💕', '心动': '💓',
+    '火花': '✨', '闪亮': '✨', '星星': '⭐', '皇冠': '👑',
+    '宝藏': '💎', '钻石': '💎', '糖': '🍬', '蛋糕': '🍰',
+    '奶茶': '🧋', '咖啡': '☕', '干杯': '🍻', '庆祝': '🎉',
+    '撒花': '🎊', '礼物': '🎁', '红包': '🧧', '钱': '💰',
+    '66': '👍', 'ok啦': '👌', '闭嘴': '🤐', '嘘': '🤫',
+    '偷看': '🫣', '吃惊了': '😲', '思考人生': '🤔', '真香': '😋',
+    '好吃': '😋', '暴风吸入': '😋', '贴贴': '🫂', '抱住': '🫂',
+    '亲亲': '😘', '么么哒': '😘', '飞扑': '🤗', '晚安': '🌙',
+    '早安': '☀️', '睡觉': '😴', '困': '😴', '打哈欠': '🥱',
+    '摸头': '🫂', '拍手': '👏', '拍拍': '👏', '哈哈大笑': '😂',
+    '笑疯了': '🤣', '绝绝子': '✨', '酸了': '🍋', '柠檬': '🍋',
+    '我酸了': '🍋', '西瓜': '🍉', '瓜': '🍉', '鸽': '🕊️',
+    '咕咕': '🕊️', '鸡汤': '🍲', '火锅': '🍲', '爆米花': '🍿',
+    '摸鱼': '🐟', '咸鱼': '🐟', '猫猫': '🐱', '喵': '🐱',
+    '小猫': '🐱', '狗狗': '🐶', '旺旺': '🐶', '兔兔': '🐰',
+    '猪头': '🐷', '熊': '🐻', '熊猫': '🐼', '狐狸': '🦊',
+    '星星闪烁': '✨', '闪电': '⚡', '彩虹': '🌈', '月亮': '🌙',
+    '太阳': '☀️', '雪花': '❄️', '冰淇淋': '🍦', '奶茶局': '🧋',
+    '叹气': '😮‍💨', '吐血': '🩸', '呕吐': '🤮', '晕倒': '😵',
+    '尴尬而不失礼貌的微笑': '🙃', '倒笑': '🙃', '癫': '🤪',
+    '问号': '❓', '感叹号': '❗', '100': '💯', '满分': '💯',
+    '第一': '🥇', '冠军': '🏆', '奖杯': '🏆', '便便': '💩',
+  };
+
+  function buildDanmakuFragment(rawText, textShadowCss) {
+    const frag = document.createDocumentFragment();
+    const s = String(rawText || '');
+    EMOTE_PATTERN.lastIndex = 0;
+    let last = 0;
+    let m;
+    while ((m = EMOTE_PATTERN.exec(s)) !== null) {
+      if (m.index > last) {
+        const span = document.createElement('span');
+        span.className = 'dm-text';
+        span.style.textShadow = textShadowCss;
+        span.textContent = s.slice(last, m.index);
+        frag.appendChild(span);
+      }
+      const emoji = EMOTE_MAP[m[1]];
+      if (emoji) {
+        const em = document.createElement('span');
+        em.className = 'dm-emoji';
+        em.textContent = emoji;
+        frag.appendChild(em);
+      } else {
+        const span = document.createElement('span');
+        span.className = 'dm-text';
+        span.style.textShadow = textShadowCss;
+        span.textContent = m[0];
+        frag.appendChild(span);
+      }
+      last = EMOTE_PATTERN.lastIndex;
+    }
+    if (last < s.length || last === 0) {
+      const rest = s.slice(last);
+      if (rest || last === 0) {
+        const span = document.createElement('span');
+        span.className = 'dm-text';
+        span.style.textShadow = textShadowCss;
+        span.textContent = rest;
+        frag.appendChild(span);
+      }
+    }
+    return frag;
+  }
+
+  // ===== Media-Clock Synchronized Uniform-Velocity Danmaku Engine =====
+  const dmActive = [];
+  const dmSpawned = new Set();
+  let lastDmRafAt = performance.now();
+  let lastDmClockPos = 0;
+
+  function clearDanmakuDom() {
+    for (let i = 0; i < dmActive.length; i++) {
+      dmActive[i].el.remove();
+    }
+    dmActive.length = 0;
+    dmLayerEl.innerHTML = '';
+    dmSpawned.clear();
+  }
+  function resetDanmakuClock() {
+    lastDmRafAt = performance.now();
+    lastDmClockPos = state.pos;
+    dmSpawned.clear();
+  }
+  function strokeCss(mode) {
+    if (mode === 'shadow') return '2px 2px 3px rgba(0,0,0,0.92)';
+    if (mode === 'outline') return '-1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000';
+    if (mode === 'none') return 'none';
+    return '-1.5px -1.5px 0 #000, 1.5px -1.5px 0 #000, -1.5px 1.5px 0 #000, 1.5px 1.5px 0 #000, 0 2px 4px rgba(0,0,0,0.85)';
+  }
+  function pickFreeDanmakuLane(maxLanes, stageW, minGapPx) {
+    for (let l = 0; l < maxLanes; l++) {
+      let maxRight = -Infinity;
+      for (let j = 0; j < dmActive.length; j++) {
+        const d = dmActive[j];
+        if (d.lane === l) {
+          const rightEdge = d.x + d.w;
+          if (rightEdge > maxRight) maxRight = rightEdge;
+        }
+      }
+      if (maxRight === -Infinity || maxRight + minGapPx <= stageW) {
+        return l;
+      }
+    }
+    return -1;
+  }
+  function stepDanmaku(nowPerf) {
+    const dtSec = Math.min(0.08, Math.max(0, (nowPerf - lastDmRafAt) / 1000));
+    lastDmRafAt = nowPerf;
+    const isPip = frameEl.classList.contains('is-pip');
+    const w = dmLayerEl.clientWidth || frameEl.clientWidth || 900;
+    const h = dmLayerEl.clientHeight || frameEl.clientHeight || 500;
+    // Fixed per-frame uniform horizontal speed guarantees zero intra-lane overtake collisions
+    const pxPerSec = Math.max(90, (w + 180) / Math.max(4, state.danmaku.speedSec));
+
+    if (!state.danmaku.enabled) {
+      if (dmActive.length > 0) clearDanmakuDom();
+      requestAnimationFrame(stepDanmaku);
+      return;
+    }
+
+    if (Math.abs(state.pos - lastDmClockPos) > 1.8) {
+      clearDanmakuDom();
+    }
+    lastDmClockPos = state.pos;
+
+    const moving = !state.paused && !state.buffering;
+    if (moving && dtSec > 0) {
+      for (let i = dmActive.length - 1; i >= 0; i--) {
+        const d = dmActive[i];
+        d.x -= pxPerSec * dtSec;
+        if (d.x + d.w < -36) {
+          d.el.remove();
+          dmActive.splice(i, 1);
+        } else {
+          d.el.style.transform = `translate3d(${d.x.toFixed(1)}px, 0, 0)`;
+        }
+      }
+    }
+
+    if (moving && state.danmakuItems.length > 0) {
+      const isTallWin = frameEl.classList.contains('is-tall-window');
+      const isIdle = frameEl.classList.contains('is-idle');
+      const widthScale = w < 520 ? Math.max(0.76, w / 520) : 1.0;
+      const basePx = isPip ? 13.5 : 18;
+      const fontPx = Math.max(11, Math.round(basePx * state.danmaku.fontScale * widthScale));
+      const laneH = Math.max(17, Math.round(fontPx * 1.38));
+      const topBase = isPip ? (isIdle ? 8 : 40) : (isTallWin ? 52 : (isIdle ? 14 : 46));
+      const bottomSafe = isPip ? (isIdle ? 14 : 68) : 74;
+      const usableH = Math.max(laneH, h - topBase - bottomSafe);
+      const maxLanes = Math.max(1, Math.floor((usableH * state.danmaku.region) / laneH));
+      const minGapPx = Math.max(24, Math.round(fontPx * 1.4));
+      const textShadowCss = strokeCss(state.danmaku.stroke);
+      const nowSec = state.pos;
+
+      for (let i = 0; i < state.danmakuItems.length; i++) {
+        const it = state.danmakuItems[i];
+        const tSec = (it.timeMs ?? it.time_ms ?? 0) / 1000;
+        const key = `${it.id ?? i}:${Math.round(tSec * 10)}`;
+        if (dmSpawned.has(key)) continue;
+        if (tSec >= nowSec - 0.35 && tSec <= nowSec + 0.45) {
+          const lane = pickFreeDanmakuLane(maxLanes, w, minGapPx);
+          if (lane === -1) continue;
+          dmSpawned.add(key);
+
+          const el = document.createElement('div');
+          el.className = 'dm-item';
+          el.style.fontSize = `${fontPx}px`;
+          el.style.fontFamily = state.danmaku.font;
+          el.style.fontWeight = state.danmaku.bold ? '700' : '400';
+          el.style.opacity = String(state.danmaku.opacity);
+          el.style.color = it.color || state.danmaku.color;
+          el.style.top = `${topBase + lane * laneH}px`;
+          const startX = w + 16;
+          el.style.transform = `translate3d(${startX}px, 0, 0)`;
+          el.appendChild(buildDanmakuFragment(it.text, textShadowCss));
+          dmLayerEl.appendChild(el);
+
+          const tw = Math.max(24, el.offsetWidth || 120);
+          dmActive.push({ el, lane, x: startX, w: tw, textKey: key });
+        }
+      }
+    }
+
+    requestAnimationFrame(stepDanmaku);
+  }
+  requestAnimationFrame(stepDanmaku);
+
+  // ===== Actions Dispatch =====
+  function handleAction(act, rawVal) {
+    wakeHud();
+    if (state.locked && act !== 'lock' && act !== 'close' && act !== 'min') {
+      showToast('界面已锁定 · 按 H 解锁', IC.lockClosed);
+      return;
+    }
+    switch (act) {
+      case 'dm-toggle':
+        toggleDanmaku(true);
+        break;
+      case 'cycle-rate': {
+        const rates = [1.0, 1.25, 1.5, 2.0];
+        const idx = rates.findIndex((r) => Math.abs(r - state.speed) < 0.05);
+        const next = rates[(idx + 1) % rates.length];
+        state.speed = next;
+        postHost({ cmd: 'speed', value: next });
+        showToast(`倍速 ${next}x`, IC.spark);
+        break;
+      }
+      case 'restore-window':
+        state.pip = false;
+        postHost({ cmd: 'restoreWindow' });
+        showToast('已还原主窗口', IC.restoreWin || IC.max);
+        break;
+      case 'home':
+        postHost({ cmd: 'home' });
+        break;
+      case 'min':
+        postHost({ cmd: 'minimize' });
+        break;
+      case 'max':
+        postHost({ cmd: 'maximize' });
+        break;
+      case 'close':
+        postHost({ cmd: 'close' });
+        break;
+      case 'play':
+        state.paused = !state.paused;
+        postHost({ cmd: 'togglePause' });
+        showToast(state.paused ? '已暂停' : '继续播放', state.paused ? IC.pause : IC.play);
+        break;
+      case 'prev':
+        postHost({ cmd: 'prev' });
+        break;
+      case 'next':
+        postHost({ cmd: 'next' });
+        break;
+      case 'seek-rel': {
+        const delta = Number(rawVal) || 0;
+        const target = Math.max(0, Math.min(state.duration || 99999, state.pos + delta));
+        state.pos = target;
+        const seekSeq = markPendingSeek(target);
+        clearDanmakuDom();
+        postHost({ cmd: 'seekRel', delta, seekSeq });
+        showToast(`${delta > 0 ? '快进' : '快退'} ${Math.abs(delta)} 秒`, delta > 0 ? IC.fwd10 : IC.back10);
+        break;
+      }
+      case 'mute':
+        state.muted = !state.muted;
+        postHost({ cmd: 'mute', muted: state.muted });
+        showToast(state.muted ? '已静音' : `音量 ${Math.round(state.volume)}%`, state.muted ? IC.mute : IC.vol);
+        break;
+      case 'rate': {
+        const v = Number(rawVal) || 1.0;
+        state.speed = v;
+        state.openMenu = null;
+        postHost({ cmd: 'speed', value: v });
+        showToast(`倍速 ${v}x`, IC.spark);
+        break;
+      }
+      case 'set-fg': {
+        const m = Number(rawVal) || 0;
+        if (m <= 0) {
+          state.fgEnabled = false;
+          postHost({ cmd: 'fg', on: false, mult: state.fgMult });
+          showToast('光流补帧已关闭', IC.spark);
+        } else {
+          state.fgEnabled = true;
+          state.fgMult = Math.min(5, Math.max(2, m));
+          postHost({ cmd: 'fg', on: true, mult: state.fgMult });
+          showToast(`GPU 光流补帧 ${state.fgMult}X`, IC.spark);
+        }
+        state.openMenu = null;
+        break;
+      }
+      case 'fgmode': {
+        state.fgMode = String(rawVal || 'auto');
+        postHost({ cmd: 'fgMode', mode: state.fgMode });
+        const map = { auto: '自动识别', drama: '真人短剧', comic: '漫剧', anime: '动漫' };
+        showToast(`光流模式：${map[state.fgMode] || '自动'}`, IC.spark);
+        break;
+      }
+      case 'autoplay':
+        state.autoplay = !state.autoplay;
+        postHost({ cmd: 'autoplay', on: state.autoplay });
+        showToast(state.autoplay ? '自动连播已开启' : '自动连播已关闭', IC.spark);
+        break;
+      case 'pin':
+        state.topmost = !state.topmost;
+        postHost({ cmd: 'pin', on: state.topmost });
+        showToast(state.topmost ? '窗口已置顶' : '取消窗口置顶', IC.pin);
+        break;
+      case 'theme':
+        state.theme = state.theme === 'dark' ? 'light' : 'dark';
+        postHost({ cmd: 'theme', theme: state.theme });
+        showToast(state.theme === 'dark' ? '黑白主题：深邃黑' : '黑白主题：极简白', state.theme === 'dark' ? IC.moon : IC.sun);
+        break;
+      case 'full':
+        state.fullscreen = !state.fullscreen;
+        state.openMenu = null;
+        postHost({ cmd: 'fullscreen', on: state.fullscreen });
+        break;
+      case 'lock':
+        state.locked = !state.locked;
+        if (state.locked) {
+          state.openMenu = null;
+          state.drawerOpen = false;
+          state.shortcutsOpen = false;
+        }
+        showToast(state.locked ? '界面已锁定 · 按 H 解锁' : '界面已解锁', state.locked ? IC.lockClosed : IC.lockOpen);
+        break;
+      case 'osd':
+        state.osdOpen = !state.osdOpen;
+        break;
+      case 'shortcuts':
+        state.shortcutsOpen = !state.shortcutsOpen;
+        state.openMenu = null;
+        state.drawerOpen = false;
+        break;
+      case 'drawer':
+        state.drawerOpen = !state.drawerOpen;
+        state.openMenu = null;
+        state.shortcutsOpen = false;
+        if (state.drawerOpen) renderEpisodeSheet();
+        break;
+      case 'ep': {
+        const idx = Number(rawVal);
+        if (Number.isInteger(idx) && idx >= 0) {
+          state.drawerOpen = false;
+          clearDanmakuDom();
+          postHost({ cmd: 'pickEpisode', index: idx });
+        }
+        break;
+      }
+      case 'aspect':
+        state.aspect = String(rawVal || 'fit');
+        postHost({ cmd: 'aspect', mode: state.aspect });
+        showToast(`画面比例：${state.aspect === 'cover' ? '裁剪' : state.aspect === 'stretch' ? '拉伸' : '适应'}`, IC.max);
+        break;
+      case 'fit-window':
+        postHost({ cmd: 'fitWindow' });
+        break;
+      case 'step-frame':
+        state.paused = true;
+        postHost({ cmd: 'frameStep', dir: Number(rawVal) || 1 });
+        showToast((Number(rawVal) || 1) < 0 ? '上一帧' : '下一帧', IC.spark);
+        break;
+      case 'shot':
+        postHost({ cmd: 'shot' });
+        showToast('正在保存截图…', IC.spark);
+        break;
+      case 'ab':
+        if (state.abA === null) {
+          state.abA = state.pos;
+          showToast(`已标记 A 点 ${fmtTime(state.abA)}`, IC.spark);
+        } else if (state.abB === null) {
+          if (state.pos > state.abA + 0.5) {
+            state.abB = state.pos;
+            postHost({ cmd: 'loop', a: state.abA, b: state.abB });
+            showToast(`A-B 循环开启`, IC.spark);
+          } else {
+            state.abA = state.pos;
+          }
+        } else {
+          state.abA = null;
+          state.abB = null;
+          postHost({ cmd: 'loop', clear: true });
+          showToast('已清除 A-B 循环', IC.spark);
+        }
+        break;
+      case 'cycle-audio':
+        if (state.audioTracks.length > 1) {
+          state.audioTrackIdx = (state.audioTrackIdx + 1) % state.audioTracks.length;
+          const tr = state.audioTracks[state.audioTrackIdx];
+          postHost({ cmd: 'audioTrack', id: tr.id });
+          showToast(`切换音轨：${tr.title || tr.lang || tr.id}`, IC.vol);
+        } else {
+          showToast('当前仅有一路音轨', IC.vol);
+        }
+        break;
+      case 'pip':
+        state.pip = !state.pip;
+        state.openMenu = null;
+        postHost({ cmd: 'pip', on: state.pip });
+        showToast(state.pip ? '小窗预览已开启' : '已退出小窗预览', IC.max);
+        break;
+      case 'pic-preset': {
+        const preset = String(rawVal || 'orig');
+        const map = { orig: [0,0,0,0], vivid: [2,8,16,4], eye: [-4,-6,-8,-4], night: [6,4,2,10] };
+        const [b, c, s, g] = map[preset] || [0,0,0,0];
+        state.pic = { preset, brightness: b, contrast: c, saturation: s, gamma: g };
+        postHost({ cmd: 'picture', ...state.pic });
+        break;
+      }
+      case 'pic-reset':
+        state.pic = { preset: 'orig', brightness: 0, contrast: 0, saturation: 0, gamma: 0 };
+        postHost({ cmd: 'picture', ...state.pic });
+        showToast('画质参数已重置', IC.spark);
+        break;
+      case 'dm-font':
+        state.danmaku.font = String(rawVal || 'Microsoft YaHei');
+        syncDanmakuToHost();
+        break;
+      case 'dm-bold':
+        state.danmaku.bold = !state.danmaku.bold;
+        syncDanmakuToHost();
+        break;
+      case 'dm-stroke':
+        state.danmaku.stroke = String(rawVal || 'heavy');
+        syncDanmakuToHost();
+        break;
+      case 'dm-reset':
+        state.danmaku = {
+          enabled: true, region: 0.25, opacity: 1.0, fontScale: 1.0,
+          speedSec: 8.0, font: 'Microsoft YaHei', bold: true, color: '#ffffff', stroke: 'heavy',
+        };
+        syncDanmakuToHost();
+        showToast('弹幕设置已恢复默认', IC.spark);
+        break;
+    }
+    renderUI();
+  }
+
+  function syncDanmakuToHost() {
+    postHost({ cmd: 'danmakuPrefs', ...state.danmaku });
+  }
+
+  // ===== Event Wiring =====
+  document.addEventListener('click', (e) => {
+    const menuBtn = e.target.closest('[data-menu]');
+    if (menuBtn) {
+      e.stopPropagation();
+      cancelHoverMenuClose();
+      const m = menuBtn.dataset.menu;
+      state.openMenu = state.openMenu === m ? null : m;
+      state.drawerOpen = false;
+      state.shortcutsOpen = false;
+      renderUI();
+      return;
+    }
+    const actEl = e.target.closest('[data-act]');
+    if (actEl) {
+      e.stopPropagation();
+      handleAction(actEl.dataset.act, actEl.dataset.val);
+      return;
+    }
+    if (!e.target.closest('.crystal-flyout, .vol-bubble, .ep-sheet, .shortcut-box, #epBadge, #btnDrawer')) {
+      if (state.openMenu || state.drawerOpen || state.shortcutsOpen) {
+        state.openMenu = null;
+        state.drawerOpen = false;
+        state.shortcutsOpen = false;
+        renderUI();
+      }
+    }
+  });
+
+  // Video stage drag (PiP whole-stage drag) + single/double click (play/pause & fullscreen/restore)
+  let stageClickTimer = null;
+  let suppressNextStageClick = false;
+  stageEl.addEventListener('pointerdown', (e) => {
+    suppressNextStageClick = false;
+    if (e.button !== 0 || state.locked || !frameEl.classList.contains('is-pip')) return;
+    const sx = e.clientX;
+    const sy = e.clientY;
+    const onMove = (me) => {
+      if (Math.hypot(me.clientX - sx, me.clientY - sy) > 5) {
+        suppressNextStageClick = true;
+        cleanup();
+        postHost({ cmd: 'startDrag', x: Math.round(me.clientX), y: Math.round(me.clientY) });
+      }
+    };
+    const cleanup = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', cleanup);
+      window.removeEventListener('pointercancel', cleanup);
+      window.removeEventListener('blur', cleanup);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', cleanup);
+    window.addEventListener('pointercancel', cleanup);
+    window.addEventListener('blur', cleanup);
+  });
+  stageEl.addEventListener('click', () => {
+    if (suppressNextStageClick) {
+      suppressNextStageClick = false;
+      return;
+    }
+    if (state.openMenu || state.drawerOpen || state.shortcutsOpen) {
+      state.openMenu = null;
+      state.drawerOpen = false;
+      state.shortcutsOpen = false;
+      renderUI();
+      return;
+    }
+    if (state.locked) {
+      showToast('界面已锁定 · 按 H 解锁', IC.lockClosed);
+      return;
+    }
+    clearTimeout(stageClickTimer);
+    stageClickTimer = setTimeout(() => handleAction('play'), 180);
+  });
+  stageEl.addEventListener('dblclick', () => {
+    clearTimeout(stageClickTimer);
+    if (state.locked) return;
+    handleAction(frameEl.classList.contains('is-pip') ? 'restore-window' : 'full');
+  });
+
+  // Top bar borderless drag (4px threshold preserves double-click maximize/restore!)
+  document.querySelectorAll('.drag-handle').forEach((handle) => {
+    handle.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 || e.target.closest('button, input, .ep-pill')) return;
+      e.preventDefault();
+      const sx = e.clientX;
+      const sy = e.clientY;
+      const onMove = (me) => {
+        if (Math.hypot(me.clientX - sx, me.clientY - sy) > 4) {
+          cleanup();
+          postHost({ cmd: 'startDrag', x: Math.round(me.clientX), y: Math.round(me.clientY) });
+        }
+      };
+      const cleanup = () => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', cleanup);
+        window.removeEventListener('pointercancel', cleanup);
+        window.removeEventListener('blur', cleanup);
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', cleanup);
+      window.addEventListener('pointercancel', cleanup);
+      window.addEventListener('blur', cleanup);
+    });
+    handle.addEventListener('dblclick', (e) => {
+      if (e.target.closest('button, input, .ep-pill')) return;
+      handleAction(frameEl.classList.contains('is-pip') ? 'restore-window' : 'max');
+    });
+  });
+
+  // Wheel volume control over stage or volume UI (including PiP bottom dock)
+  frameEl.addEventListener('wheel', (e) => {
+    if (state.locked) return;
+    if (!e.target.closest('#videoStage, #btnVol, #menuVol, #pipBottomDock')) return;
+    e.preventDefault();
+    const next = Math.min(130, Math.max(0, Math.round(state.volume + (e.deltaY < 0 ? 5 : -5))));
+    state.volume = next;
+    state.muted = next === 0;
+    postHost({ cmd: 'volume', value: next });
+    showToast(`音量 ${next}%`, next === 0 ? IC.mute : IC.vol);
+    renderUI();
+  }, { passive: false });
+
+  // Scrubbing
+  function seekAtClientX(cx, commit) {
+    if (!(state.duration > 0) || typeof cx !== 'number' || !Number.isFinite(cx)) return;
+    lastScrubClientX = cx;
+    const r = scrubWrap.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, (cx - r.left) / Math.max(1, r.width)));
+    const maxSafeSec = state.duration > 0.6 ? Math.max(0, state.duration - 0.3) : Math.max(0, state.duration);
+    const sec = Math.min(maxSafeSec, ratio * Math.max(0, state.duration));
+    scrubPreviewSec = sec;
+    const pct = `${(ratio * 100).toFixed(2)}%`;
+    playedBar.style.width = pct;
+    scrubThumb.style.left = pct;
+    miniFill.style.width = pct;
+    scrubHint.style.left = pct;
+    scrubHint.textContent = fmtTime(sec);
+    setRoller(rollCur, fmtTime(sec));
+    if (commit) {
+      state.pos = sec;
+      const seekSeq = markPendingSeek(sec);
+      clearDanmakuDom();
+      postHost({ cmd: 'seek', pos: sec, seekSeq });
+    }
+  }
+  function finishScrub(cx, commit) {
+    if (!draggingScrub) return;
+    draggingScrub = false;
+    scrubWrap.classList.remove('scrubbing');
+    if (scrubPointerId !== null) {
+      try {
+        if (scrubWrap.hasPointerCapture?.(scrubPointerId)) {
+          scrubWrap.releasePointerCapture(scrubPointerId);
+        }
+      } catch {}
+      scrubPointerId = null;
+    }
+    const targetX = typeof cx === 'number' && Number.isFinite(cx) ? cx : lastScrubClientX;
+    lastScrubClientX = null;
+    if (commit && typeof targetX === 'number' && Number.isFinite(targetX)) {
+      seekAtClientX(targetX, true);
+    } else {
+      updateProgressUI();
+    }
+  }
+  scrubWrap.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || state.locked || !(state.duration > 0)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    draggingScrub = true;
+    scrubPointerId = e.pointerId;
+    try { scrubWrap.setPointerCapture(e.pointerId); } catch {}
+    scrubWrap.classList.add('scrubbing');
+    seekAtClientX(e.clientX, false);
+  });
+  scrubWrap.addEventListener('pointermove', (e) => {
+    const r = scrubWrap.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, (e.clientX - r.left) / Math.max(1, r.width)));
+    scrubHint.style.left = `${(ratio * 100).toFixed(2)}%`;
+    scrubHint.textContent = fmtTime(ratio * Math.max(0, state.duration));
+  });
+
+  // Volume Slider
+  const volTrack = document.getElementById('volTrack');
+  function volAtClientY(cy) {
+    const r = volTrack.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, 1 - (cy - r.top) / Math.max(1, r.height)));
+    const v = Math.round(ratio * 130);
+    state.volume = v;
+    state.muted = v === 0;
+    postHost({ cmd: 'volume', value: v });
+    renderUI();
+  }
+  volTrack.addEventListener('pointerdown', (e) => {
+    e.stopPropagation();
+    draggingVol = true;
+    cancelHoverMenuClose();
+    volAtClientY(e.clientY);
+  });
+
+  window.addEventListener('pointermove', (e) => {
+    if (draggingScrub) seekAtClientX(e.clientX, false);
+    else if (draggingVol) volAtClientY(e.clientY);
+  });
+  window.addEventListener('pointerup', (e) => {
+    if (draggingScrub) finishScrub(e.clientX, true);
+    if (draggingVol) draggingVol = false;
+    activeRangeDrag = false;
+  });
+  window.addEventListener('pointercancel', (e) => {
+    if (draggingScrub) finishScrub(e.clientX, lastScrubClientX !== null);
+    if (draggingVol) draggingVol = false;
+    activeRangeDrag = false;
+  });
+
+  // Toolbox Sliders & Switches
+  document.addEventListener('pointerdown', (e) => {
+    if (e.target.matches('input[type="range"]')) {
+      activeRangeDrag = true;
+      cancelHoverMenuClose();
+    }
+  });
+  document.addEventListener('input', (e) => {
+    const t = e.target;
+    if (t.dataset?.tune) {
+      const k = t.dataset.tune;
+      state.pic[k] = Number(t.value);
+      state.pic.preset = (state.pic.brightness === 0 && state.pic.contrast === 0 && state.pic.saturation === 0 && state.pic.gamma === 0) ? 'orig' : 'custom';
+      postHost({ cmd: 'picture', ...state.pic });
+      renderUI();
+      return;
+    }
+    if (t.dataset?.dmRange) {
+      const k = t.dataset.dmRange;
+      const v = Number(t.value);
+      state.danmaku[k] = k === 'speedSec' ? v : v / 100;
+      syncDanmakuToHost();
+      renderUI();
+      return;
+    }
+    if (t.id === 'dmColorPicker') {
+      state.danmaku.color = t.value;
+      syncDanmakuToHost();
+      renderUI();
+    }
+  });
+  document.getElementById('dmSwatches').addEventListener('click', (e) => {
+    const sw = e.target.closest('.dm-swatch');
+    if (!sw) return;
+    e.stopPropagation();
+    state.danmaku.color = sw.dataset.color || '#ffffff';
+    syncDanmakuToHost();
+    renderUI();
+  });
+  function setDanmakuEnabled(enabled, showFeedback = false) {
+    const next = Boolean(enabled);
+    state.danmaku.enabled = next;
+    if (!next) {
+      clearDanmakuDom();
+    } else if (typeof resetDanmakuClock === 'function') {
+      resetDanmakuClock();
+    }
+    syncDanmakuToHost();
+    renderUI();
+    if (showFeedback) {
+      showToast(next ? '弹幕已开启' : '弹幕已关闭', next ? (IC.danmakuOn || IC.spark) : (IC.danmakuOff || IC.spark));
+    }
+  }
+  function toggleDanmaku(showFeedback = true) {
+    setDanmakuEnabled(!state.danmaku.enabled, showFeedback);
+  }
+  document.getElementById('dmToggle').addEventListener('change', (e) => {
+    setDanmakuEnabled(e.target.checked, false);
+  });
+  document.getElementById('vsrToggle').addEventListener('change', (e) => {
+    state.vsr = e.target.checked;
+    postHost({ cmd: 'vsr', on: state.vsr });
+    showToast(
+      state.vsr
+        ? (state.vsrHwSupported ? 'RTX VSR 硬件超分与画质增强已开启' : 'GPU 清晰度增强已开启')
+        : 'RTX VSR 画质增强已关闭',
+      IC.spark
+    );
+    renderUI();
+  });
+  document.addEventListener('dblclick', (e) => {
+    const tune = e.target.closest('input[type="range"][data-tune]');
+    if (!tune) return;
+    const k = tune.dataset.tune;
+    state.pic[k] = 0;
+    state.pic.preset = (state.pic.brightness === 0 && state.pic.contrast === 0 && state.pic.saturation === 0 && state.pic.gamma === 0) ? 'orig' : 'custom';
+    postHost({ cmd: 'picture', ...state.pic });
+    renderUI();
+  });
+
+  // Countdown card buttons
+  document.getElementById('btnCdGo').addEventListener('click', (e) => {
+    e.stopPropagation();
+    postHost({ cmd: 'countdownGo' });
+  });
+  document.getElementById('btnCdCancel').addEventListener('click', (e) => {
+    e.stopPropagation();
+    state.countdownActive = false;
+    postHost({ cmd: 'countdownCancel' });
+    renderUI();
+  });
+
+  // Episode search
+  const epSearch = document.getElementById('epSearch');
+  epSearch.addEventListener('input', (e) => {
+    state.searchQuery = e.target.value;
+    renderEpisodeSheet();
+  });
+  epSearch.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const n = Number(epSearch.value.trim());
+      if (Number.isInteger(n) && n >= 1) {
+        epSearch.value = '';
+        state.searchQuery = '';
+        handleAction('ep', n - 1);
+      }
+    } else if (e.key === 'Escape') {
+      state.drawerOpen = false;
+      renderUI();
+    }
+  });
+
+  // Full Keyboard Shortcut Handling (with Right-Arrow Hold 3x Boost)
+  let rightDownAt = 0;
+  let rightBoostTimer = null;
+  document.addEventListener('keydown', (e) => {
+    if (document.activeElement && ['INPUT', 'SELECT'].includes(document.activeElement.tagName)) return;
+    wakeHud();
+    const k = e.key.toLowerCase();
+    if (state.locked) {
+      if (k === 'h' || e.key === 'Escape') handleAction('lock');
+      else showToast('界面已锁定 · 按 H 解锁', IC.lockClosed);
+      return;
+    }
+    if (e.code === 'Space') { e.preventDefault(); handleAction('play'); }
+    else if (e.key === '?' || e.key === 'F1') { e.preventDefault(); handleAction('shortcuts'); }
+    else if (e.key === 'Escape') {
+      if (state.shortcutsOpen) { state.shortcutsOpen = false; renderUI(); }
+      else if (state.drawerOpen) { state.drawerOpen = false; renderUI(); }
+      else if (state.openMenu) { state.openMenu = null; renderUI(); }
+      else if (state.fullscreen) handleAction('full');
+    } else if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      handleAction('seek-rel', e.shiftKey ? -30 : -10);
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      if (e.repeat) return;
+      rightDownAt = performance.now();
+      rightBoostTimer = setTimeout(() => {
+        state.boostHold = true;
+        postHost({ cmd: 'boostStart' });
+        renderUI();
+      }, 240);
+    } else if (k === 'j') handleAction('seek-rel', -5);
+    else if (k === 'l') handleAction('seek-rel', 5);
+    else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      const next = Math.min(130, Math.max(0, Math.round(state.volume + (e.key === 'ArrowUp' ? 5 : -5))));
+      state.volume = next;
+      state.muted = next === 0;
+      postHost({ cmd: 'volume', value: next });
+      showToast(`音量 ${next}%`, next === 0 ? IC.mute : IC.vol);
+      renderUI();
+    } else if (k === 'm') handleAction('mute');
+    else if (k === 'b') handleAction('set-fg', state.fgEnabled ? 0 : (state.fgMult || 2));
+    else if (k === 'v') {
+      const next = state.aspect === 'fit' ? 'cover' : state.aspect === 'cover' ? 'stretch' : 'fit';
+      handleAction('aspect', next);
+    }
+    else if (k === '[' || k === ']') handleAction('ab');
+    else if (e.key === ',') handleAction('step-frame', -1);
+    else if (e.key === '.') handleAction('step-frame', 1);
+    else if (k === 's') handleAction('shot');
+    else if (k === 'p') handleAction('prev');
+    else if (k === 'n') handleAction('next');
+    else if (k === 'e') handleAction('drawer');
+    else if (k === 'k') handleAction('pin');
+    else if (k === 'h') handleAction('lock');
+    else if (k === 'i') handleAction('osd');
+    else if (k === 'd') toggleDanmaku(true);
+    else if (k === 'a') handleAction('autoplay');
+    else if (k === 'f' || e.key === 'F11') { e.preventDefault(); handleAction('full'); }
+  });
+
+  document.addEventListener('keyup', (e) => {
+    if (e.key !== 'ArrowRight' || !rightDownAt) return;
+    clearTimeout(rightBoostTimer);
+    const held = performance.now() - rightDownAt;
+    rightDownAt = 0;
+    if (state.boostHold || held >= 240) {
+      state.boostHold = false;
+      postHost({ cmd: 'boostEnd' });
+      renderUI();
+    } else {
+      handleAction('seek-rel', 10);
+    }
+  });
+
+  // ===== Receive Host State & Events =====
+  if (window.chrome && window.chrome.webview) {
+    window.chrome.webview.addEventListener('message', (ev) => {
+      const msg = typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data;
+      if (!msg || typeof msg !== 'object') return;
+      switch (msg.type) {
+        case 'hostLeave':
+          lastPointerInside = false;
+          if (!activePickerLock) clearActiveDragStates(true);
+          if (state.openMenu && !activeRangeDrag && !activePickerLock && !draggingVol) {
+            scheduleHoverMenuClose(220);
+          }
+          if (!isInteractionHoldingHud() && !state.idle) {
+            setTimeout(() => {
+              if (!isInteractionHoldingHud() && performance.now() - lastActivityAt > 350) {
+                state.idle = true;
+                frameEl.classList.add('is-idle');
+                syncMiniProgressVisibility();
+              }
+            }, 420);
+          }
+          break;
+        case 'hostCaptureLost':
+          clearActiveDragStates();
+          break;
+        case 'hostResize': {
+          const effScale = (typeof msg.scale === 'number' && msg.scale > 0.25)
+            ? msg.scale
+            : (window.devicePixelRatio || 1);
+          if (typeof msg.w === 'number' && typeof msg.h === 'number') {
+            hostTargetCss = { w: msg.w / effScale, h: msg.h / effScale };
+          }
+          markResizingWindow();
+          syncVideoRect();
+          scheduleHostResizeSettle();
+          break;
+        }
+        case 'state':
+          applyHostState(msg);
+          break;
+        case 'progress':
+          if (typeof msg.pos === 'number' && shouldAcceptHostPos(msg.pos, msg.seeking, msg.seekSeq)) {
+            state.pos = msg.pos;
+          }
+          if (typeof msg.duration === 'number') state.duration = msg.duration;
+          if (typeof msg.buffer === 'number') state.bufferPos = msg.buffer;
+          if (typeof msg.paused === 'boolean') state.paused = msg.paused;
+          if (typeof msg.buffering === 'boolean') state.buffering = msg.buffering;
+          if (typeof msg.hasFrame === 'boolean') state.hasFrame = msg.hasFrame;
+          if (typeof msg.outFps === 'number') state.outFps = msg.outFps;
+          if (typeof msg.srcFps === 'number') state.srcFps = msg.srcFps;
+          if (typeof msg.videoW === 'number') state.videoW = msg.videoW;
+          if (typeof msg.videoH === 'number') state.videoH = msg.videoH;
+          if (typeof msg.hwdec === 'string') state.hwdec = msg.hwdec;
+          updateProgressUI();
+          document.getElementById('loadingPill').classList.toggle('show', shouldShowLoadingPill());
+          document.getElementById('btnPlay').innerHTML = state.paused ? IC.play : IC.pause;
+          {
+            const pipPlayEl = document.getElementById('pipPlay');
+            if (pipPlayEl) pipPlayEl.innerHTML = state.paused ? IC.play : IC.pause;
+            const pipPlayInlineEl = document.getElementById('pipPlayInline');
+            if (pipPlayInlineEl) pipPlayInlineEl.innerHTML = state.paused ? IC.play : IC.pause;
+          }
+          updateResponsiveLayout();
+          if (state.osdOpen) renderUI();
+          break;
+        case 'danmakuData':
+          if (Array.isArray(msg.items)) {
+            state.danmakuItems = msg.items;
+          }
+          break;
+        case 'danmakuClear':
+          state.danmakuItems = [];
+          clearDanmakuDom();
+          break;
+        case 'tracks':
+          if (Array.isArray(msg.tracks)) {
+            state.audioTracks = msg.tracks.filter((t) => t.type === 'audio');
+            renderUI();
+          }
+          break;
+        case 'toast':
+          showToast(msg.text || '', IC.spark);
+          break;
+      }
+    });
+  }
+
+  function applyHostState(s) {
+    if (s.theme) state.theme = s.theme === 'light' ? 'light' : 'dark';
+    if (typeof s.title === 'string') state.title = s.title;
+    if (typeof s.ep === 'number') state.ep = s.ep;
+    if (typeof s.totalEps === 'number') state.totalEps = s.totalEps;
+    if (typeof s.currentIndex === 'number') state.currentIndex = s.currentIndex;
+    if (typeof s.paused === 'boolean') state.paused = s.paused;
+    if (typeof s.buffering === 'boolean') state.buffering = s.buffering;
+    if (typeof s.hasFrame === 'boolean') state.hasFrame = s.hasFrame;
+    if (typeof s.pos === 'number' && shouldAcceptHostPos(s.pos, s.seeking, s.seekSeq)) state.pos = s.pos;
+    if (typeof s.duration === 'number') state.duration = s.duration;
+    if (typeof s.volume === 'number') state.volume = s.volume;
+    if (typeof s.muted === 'boolean') state.muted = s.muted;
+    if (typeof s.speed === 'number') state.speed = s.speed;
+    if (typeof s.fgEnabled === 'boolean') state.fgEnabled = s.fgEnabled;
+    if (typeof s.fgMult === 'number') state.fgMult = s.fgMult;
+    if (typeof s.fgMode === 'string') state.fgMode = s.fgMode;
+    if (typeof s.autoplay === 'boolean') state.autoplay = s.autoplay;
+    if (typeof s.topmost === 'boolean') state.topmost = s.topmost;
+    if (typeof s.fullscreen === 'boolean') state.fullscreen = s.fullscreen;
+    if (typeof s.pip === 'boolean') state.pip = s.pip;
+    if (typeof s.videoW === 'number') state.videoW = s.videoW;
+    if (typeof s.videoH === 'number') state.videoH = s.videoH;
+    if (typeof s.vsr === 'boolean') state.vsr = s.vsr;
+    if (typeof s.vsrHwActive === 'boolean') state.vsrHwActive = s.vsrHwActive;
+    if (typeof s.vsrHwSupported === 'boolean') state.vsrHwSupported = s.vsrHwSupported;
+    if (typeof s.aspect === 'string') state.aspect = s.aspect;
+    if (s.picture && typeof s.picture === 'object') Object.assign(state.pic, s.picture);
+    if (s.danmaku && typeof s.danmaku === 'object') Object.assign(state.danmaku, s.danmaku);
+    if (typeof s.countdownActive === 'boolean') state.countdownActive = s.countdownActive;
+    if (typeof s.countdownLeft === 'number') state.countdownLeft = s.countdownLeft;
+    if (typeof s.countdownTitle === 'string') state.countdownTitle = s.countdownTitle;
+    renderUI();
+  }
+
+  renderUI();
+  syncVideoRect();
+  postHost({ cmd: 'hudReady' });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+# `.taurignore` —— 让 `tauri dev` 的文件监听器不因为"原生播放器项目的构建产物/日志"而重启。
+#
+# ## 依据（tauri-cli 2.11.4，源码 `crates/tauri-cli/src/interface/rust.rs`）
+#
+#   * 监听器**不读**项目的 `.gitignore`。`build_ignore_matcher()` 只从
+#     `require_git(false).ignore(false)` 的遍历里收集 **`.taurignore`** 文件，
+#     再拼上内置的 `tauri-dev-watcher.gitignore`（内容只有
+#     node_modules/ target/ gen/ Cargo.lock .DS_Store）。
+#   * 因此**没有 `.taurignore` 时，`src-tauri/` 下除上述五项以外的一切都在监听范围**，
+#     包括 `native-player/bin/` 与 `native-player/obj/`。
+#   * 命中变更时它做的是 `child.kill()` + `child.wait()` + 重新 `run`：
+#     也就是**杀掉正在跑的应用进程并重启**，用户当前这次播放会连同窗口一起被打断。
+#
+# 这一条是**已在源码层确认**的机制；但"某一台机器上某一次闪退就是这个引起的"
+# 仍需逐例核对（见 `IpcPipe.cs::Log` 的注释里对 20:58 那次日志断尾的说明：
+# 那次没有系统级崩溃事件，成因未证实）。
+#
+# 语法与 gitignore 一致（`GitignoreBuilder`），且**按目录生效**：本文件只管
+# `src-tauri/` 这棵子树。`**` 是需要的 —— 嵌套项目 `LsfgPipeline/` 的产物
+# 不在 `native-player/bin` 这条路径下（实测漏过：只写 `native-player/bin` 时
+# `native-player/LsfgPipeline/bin/Debug/*.dll` 仍会触发重启）。
+
+native-player/bin
+native-player/obj
+native-player/**/bin
+native-player/**/obj
+native-player/**/*.log
+resources/ttv-player
+resources/ttv-player/**
+ttv-player/target
+ttv-player/target/**
+target-*
+target-*/**
+.codex-target*
+.codex-target*/**

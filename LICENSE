@@ -1,0 +1,131 @@
+# PolyForm Noncommercial License 1.0.0
+
+<https://polyformproject.org/licenses/noncommercial/1.0.0>
+
+Copyright (c) 2026 kiocou
+
+## Acceptance
+
+In order to get any license under these terms, you must agree
+to them as both strict obligations and conditions to all
+your licenses.
+
+## Copyright License
+
+The licensor grants you a copyright license for the
+software to do everything you might do with the software
+that would otherwise infringe the licensor's copyright
+in it for any permitted purpose. However, you may
+only distribute the software according to [Distribution
+Limitation](#distribution-limitation) and make changes or
+new works based on the software according to [Changes and
+New Works Limitation](#changes-and-new-works-limitation).
+
+## Distribution Limitation
+
+The license grants you a license to distribute, and
+make available for use, the software only to the extent
+that you do not charge a fee or require any other form
+of compensation for doing so.
+
+## Changes and New Works Limitation
+
+You may make changes or new works based on the software
+only for permitted purposes. You may distribute, and
+make available for use, changes or new works only under
+these terms, and only according to [Distribution
+Limitation](#distribution-limitation).
+
+## Notices
+
+You must ensure that anyone who gets a copy of any part of
+the software from you also gets a copy of these terms or the
+URL for them above, as well as copies of any plain-text lines
+beginning with `Required Notice:` that the licensor provided
+with the software.
+
+## Noncommercial Purpose
+
+Any noncommercial purpose is a permitted purpose.
+
+## Personal Uses
+
+Personal use for research, experiment, and testing for
+the benefit of public knowledge, personal study, private
+entertainment, hobby projects, amateur pursuits, or religious
+observance, without any anticipated commercial application,
+is use for a noncommercial purpose.
+
+## Noncommercial Organizations
+
+Use by any charitable organization, educational institution,
+public research organization, public safety or health
+organization, environmental protection organization, or
+government institution is use for a noncommercial purpose
+if the use does not involve the provision of goods or services
+for a fee or in exchange for other compensation.
+
+## Fair Use
+
+You may have "fair use" rights for the software under the
+law. These terms do not limit them.
+
+## Patent License
+
+The licensor grants you a patent license for the software that
+covers patent claims the licensor can license, or becomes able
+to license, that you would infringe by using the software.
+
+## Patent Defense
+
+If you make any written claim that the software infringes or
+contributes to infringement of any patent, your patent license
+for the software granted under these terms ends immediately. If
+your company makes such a claim, your patent license ends
+immediately for work on behalf of your company.
+
+## Violations
+
+The first time you are notified in writing that you have
+violated any of these terms, or done anything with the
+software not covered by your licenses, your licenses can
+nonetheless continue if you come into full compliance with
+these terms, and take practical steps to correct past
+violations, within 32 days of receiving notice. Otherwise,
+all your licenses end immediately.
+
+## No Liability
+
+***As far as the law allows, the software comes as is, without
+any warranty or condition, and the licensor will not be liable
+to you for any damages arising out of these terms or the use
+or nature of the software, under any kind of legal claim.***
+
+## Definitions
+
+The **licensor** is the individual or entity offering these
+terms, and the **software** is the software the licensor makes
+available under these terms.
+
+**You** means an individual or entity agreeing to these terms.
+
+**Use** means anything you do with the software requiring one
+of your licenses under these terms.
+
+================================================================================
+Required Notice: Attribution & Scope
+================================================================================
+
+1. 本软件源码按 **PolyForm Noncommercial License 1.0.0** 开源，仅限**个人学习、
+   技术研究与非商业用途**，禁止任何形式的商业使用、收费分发或用于盈利性产品/服务。
+
+2. 本项目包含对第三方协议的干净移植与前端/桌面端工程实现，涉及第三方接口或组件的
+   归属与许可证要求见 `THIRD-PARTY-NOTICES.md`：
+   - `src-tauri/src/hongguo/` 移植自 Apache-2.0 项目 `beilunyang/openhongguo`；
+   - `src-tauri/resources/shortdrama-worker/` 与 `src-tauri/guo-core/` 涉及第三方
+     非公开接口适配逻辑，仅作技术研究参考，使用者须自行承担遵守相关法律法规与
+     平台服务条款的全部责任，禁止用于商业或侵权用途。
+
+3. 公开源码仓库不包含第三方预编译二进制（如 GPLv3 构建的 `ffmpeg.exe`、嵌入式
+   CPython、`libmpv-2.dll` 及预编译 DLL）。如需本地完整打包，请按
+   `THIRD-PARTY-NOTICES.md` 中的清单自行准备对应组件并遵守各自开源协议义务。

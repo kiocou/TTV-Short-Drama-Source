@@ -1,0 +1,123 @@
+import React, { useEffect, useState } from 'react';
+import { usePlaybackActions, usePlaybackStore } from '../../stores/usePlaybackStore';
+import { X, Activity, Cpu, HardDrive, Wifi, ShieldCheck } from 'lucide-react';
+
+/** WebView 真正能测到的播放指标。 */
+interface LiveStats {
+  fps: number;
+  decoded: number;
+  dropped: number;
+  width: number;
+  height: number;
+  source: string;
+}
+
+const EMPTY_LIVE: LiveStats = { fps: 0, decoded: 0, dropped: 0, width: 0, height: 0, source: '—' };
+
+/** 主播放器元素（本应用常驻且唯一）。 */
+type FrameVideo = HTMLVideoElement & {
+  requestVideoFrameCallback?: (cb: () => void) => number;
+  cancelVideoFrameCallback?: (handle: number) => void;
+  getVideoPlaybackQuality?: () => { totalVideoFrames: number; droppedVideoFrames: number };
+};
+
+export const DiagnosticsModal: React.FC = () => {
+  // 指标面板需要实时读数（position/buffered），所以**必须**继续用整表。
+  const { sessionId, position, duration, buffered } = usePlaybackStore();
+  // 低频动作与身份走专线，避免把整表的订阅面再扩大一份。
+  const { currentSeries, currentEpisode, isDiagnosticsOpen, toggleDiagnostics } = usePlaybackActions();
+
+
+  // 指标直接从 <video> 采样：后端没有增强引擎上报的 actual_fps / 丢帧，
+  // 这里展示的是真正可测量的事实。
+  const [live, setLive] = useState<LiveStats>(EMPTY_LIVE);
+  useEffect(() => {
+    if (!isDiagnosticsOpen) return;
+    /**
+     * 取**正在渲染**的那块 `<video>`（2026-10-26 修）。
+     *
+     * 短剧宿主是常驻 DOM 的（离开播放器只是 `display:none`），动漫播放器另有
+     * 自己的一块。旧写法 `querySelector('video')` 拿的是文档里第一块 —— 在动漫
+     * 页会一直采样那块隐藏的短剧元素，`requestVideoFrameCallback` 永不回调，
+     * 面板上的 fps 恒为 0，看起来像"性能炸了"。
+     */
+    const videos = Array.from(document.querySelectorAll('video')) as FrameVideo[];
+    const video = videos.find(el => el.videoWidth > 0 && el.offsetParent !== null)
+      ?? videos.find(el => el.videoWidth > 0)
+      ?? videos[0]
+      ?? null;
+    if (!video) return;
+    let frames = 0;
+    let handle = 0;
+    let last = performance.now();
+    if (video.requestVideoFrameCallback) {
+      const onFrame = () => {
+        frames += 1;
+        handle = video.requestVideoFrameCallback?.(onFrame) ?? 0;
+      };
+      handle = video.requestVideoFrameCallback(onFrame);
+    }
+    const timer = setInterval(() => {
+      const now = performance.now();
+      const elapsedSeconds = (now - last) / 1000;
+      const quality = video.getVideoPlaybackQuality?.();
+      setLive({
+        fps: elapsedSeconds > 0 ? frames / elapsedSeconds : 0,
+        decoded: quality ? quality.totalVideoFrames : 0,
+        dropped: quality ? quality.droppedVideoFrames : 0,
+        width: video.videoWidth,
+        height: video.videoHeight,
+        source: video.src.startsWith('http://asset.localhost') ? '本地解密文件' : '网络直链',
+      });
+      frames = 0;
+      last = now;
+    }, 1000);
+    return () => {
+      clearInterval(timer);
+      if (handle && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(handle);
+    };
+  }, [isDiagnosticsOpen]);
+
+  if (!isDiagnosticsOpen) return null;
+
+  const bufferSecondsAhead = Math.max(0, buffered - position);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/20 backdrop-blur-sm animate-fade-in select-none">
+      <div 
+        onClick={(e) => e.stopPropagation()}
+        className="crystal-surface w-full max-w-lg rounded-2xl overflow-hidden animate-slide-up"
+      >
+        {/* 弹窗头部 */}
+        <div className="h-13 px-5 flex items-center justify-between border-b border-white/10 bg-white/[0.04]">
+          <div className="flex items-center gap-2.5">
+            <div className="w-7 h-7 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center border border-blue-200/50">
+              <Activity className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="text-xs font-bold text-white">全链路播放诊断</h3>
+              <p className="text-[10px] text-white/55">会话 ID: #{sessionId}</p>
+            </div>
+          </div>
+          <button
+            onClick={() => toggleDiagnostics(false)}
+            className="p-1.5 rounded-lg text-white/55 hover:text-white hover:bg-white/10 transition-colors"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {/* 核心指标栅格 */}
+        <div className="p-5 flex flex-col gap-4 text-xs">
+          {/* 剧集与来源诊断 */}
+          <div className="px-3 py-2 rounded-lg bg-white/[0.07] border border-white/10 text-[11px] text-white/70 flex items-center justify-between">
+            <span className="truncate">当前：{currentSeries?.title} - {currentEpisode?.title}</span>
+            <span className="font-mono text-[10px] text-white/50">
+              {position.toFixed(0)}s / {duration.toFixed(0)}s
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};

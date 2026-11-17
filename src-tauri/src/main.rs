@@ -1,0 +1,3070 @@
+#![windows_subsystem = "windows"]
+
+mod agent_attach;
+mod agent_bridge;
+mod agent_dock;
+mod anime_provider;
+mod dmghg_bridge;
+mod guo_provider;
+// 红果短剧的原生客户端：完整替代原 Python worker 的签名、目录与播放解析链路。
+mod hls_proxy;
+mod hongguo;
+mod hongguo_api;
+mod hongguo_bridge;
+// 黄果短剧专区（huangguo，与上面的红果 hongguo 只差一个字母，别看混）。
+mod huangguo;
+mod huangguo_provider;
+mod media_enhance;
+mod media_task;
+mod models;
+mod native_player;
+mod pip;
+mod provider;
+mod short_drama_app;
+// 视频源注册表：内置两源固定 + 插件源预留入口（本轮不加载插件代码）。
+mod source_registry;
+mod storage;
+// 播放链路的诊断日志（内存环形缓冲 + 落盘 ttv-playback.log + 接管原生 stderr）。
+mod trace;
+mod update;
+
+use crate::agent_attach::{agent_attach_all, agent_detach_all, agent_targets};
+use crate::agent_bridge::{agent_bridge_status, agent_test_call};
+use crate::agent_dock::{
+    agent_dock_action, agent_dock_drag, agent_dock_hide, agent_dock_ready, agent_dock_show,
+    agent_dock_state,
+};
+use crate::hongguo::catalog::SeriesHit;
+use crate::hongguo_api::{
+    hongguo_album, hongguo_discover, hongguo_new_releases, hongguo_person, hongguo_person_works,
+    hongguo_ranking, hongguo_search, hongguo_search_cues, hongguo_series_batch,
+    hongguo_series_detail, hongguo_series_recommend, hongguo_short_filter,
+    hongguo_short_filter_panel, hongguo_short_rank, hongguo_suggest,
+};
+use crate::models::{
+    CacheClearResult, CatalogFilter, CatalogPage, FavoriteItem, PlaybackOpenInput, PlaybackSession,
+    PlaybackSnapshot, PlaybackUiState, SeriesDetail, SeriesItem, UserSettings, WatchHistoryItem,
+};
+use crate::pip::{pip_close, pip_dismiss, pip_handoff, pip_is_open, pip_open, pip_report};
+use crate::provider::{DramaProvider, SeriesSeason};
+use crate::short_drama_app::{
+    short_drama_app_album, short_drama_app_cache_clear, short_drama_app_cache_usage,
+    short_drama_app_cancel_request, short_drama_app_cover_proxy, short_drama_app_episode_counts,
+    short_drama_app_open_stream, short_drama_app_prefetch_stream, short_drama_app_prewarm_stream,
+    short_drama_app_qualities, short_drama_app_resolve, short_drama_app_resolve_prefix,
+    short_drama_app_set_device, short_drama_app_shelf_feed, short_drama_app_status,
+    short_drama_app_stream,
+};
+use crate::storage::Database;
+use crate::trace::{trace_clear, trace_tail, trace_ui_log};
+use crate::update::{
+    app_version, update_cancel_download, update_check, update_download, update_install,
+    update_probe_network, update_reveal,
+};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tauri::{Manager, State};
+
+struct AppState {
+    provider: DramaProvider,
+    anime_provider: crate::anime_provider::AnimeProvider,
+    /// Arc 是给 [`GuoProvider::catalog`] 的 SWR 后台刷新递 `Arc<Self>` 用的；
+    /// 其余方法照常经 Deref 调用，调用点无感。
+    guo_provider: Arc<crate::guo_provider::GuoProvider>,
+    /// 黄果短剧专区（隐藏频道）。构造只建 HTTP 客户端，不做同步网络。
+    huangguo_provider: crate::huangguo_provider::HuangguoProvider,
+    /// Arc 是为了让**读命令**能把 `Database` 移进 `spawn_blocking`。
+    ///
+    /// 为什么必须这么做：`history_list` / `favorites_list` 这类命令此前是**同步**的
+    /// `#[tauri::command] fn`，Tauri 会在**窗口主线程**上直接执行它——SQLite 查询
+    /// 于是和渲染抢同一根线程。「打开应用」「回到发现页」时这几条命令恰好都在
+    /// 发车窗口里（设置/收藏/历史/目录四条并发），主观感受就是"页面卡住不动"。
+    /// 改成 async + spawn_blocking 之后，查询在阻塞池里跑，主线程只等 JoinHandle。
+    database: std::sync::Arc<Database>,
+    sessions: Mutex<HashMap<u64, PlaybackSession>>,
+    cache_dir: PathBuf,
+}
+
+/// 目录首屏返回后，后台预热两个频道的官方题材路由。
+///
+/// 点题材此前要先抓一次 `/category/{segment}` 才能把题材名换成子路由 slug，
+/// 那一次往返就压在用户的点击路径上（实测首次点题材要等一秒上下）。这里在
+/// 用户还在浏览目录时就抓好，点击时只剩题材页本身一次往返。
+///
+/// 只在第 1 页触发：翻页会反复调用 `catalog_list`，而预热只需要一次。
+/// 命中缓存时这里就是一次内存查表，无网络开销。
+fn warm_theme_routes(app: &tauri::AppHandle, page: u32) {
+    if page > 1 {
+        return;
+    }
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = handle.state::<AppState>();
+        for channel in ["drama", "comic"] {
+            let _ = state.provider.theme_routes(channel).await;
+        }
+    });
+}
+
+/// 从筛选器里取出非空关键词。
+fn keyword_of(filter: &CatalogFilter) -> Option<String> {
+    filter
+        .keyword
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// 18+ 站源被总开关挡住时统一的对外文案。
+///
+/// 不带站源名、不带内部 id（不变量 12）：这段话会直接渲染到界面上，里面出现
+/// `dsd` / `guo:dsd:…` 等于告诉调用方"这条被关的路存在、还怎么走"——门闩连
+/// 自己的钥匙形状都不该往外露。
+const ADULT_SOURCE_BLOCKED: &str = "该内容源已关闭，可在设置中重新开启。";
+
+/// 18+ 站源的总开关当前是否放行。
+///
+/// **这里必须同步取完、只把 bool 带出去**：`storage::settings_get` 内部自己拿
+/// `Mutex<Connection>` 并返回自有类型，而下面每条命令体里都散布着 `.await`。
+/// 任何把 guard 或 &UserSettings 活过 await 的写法都会把一把全局数据库锁
+/// 拖过整个网络往返——而这些命令全部在 tokio 工作线程上跑，那等于把整个应用的
+/// 设置读写串行化。现在这个函数返回 bool，锁在它返回时已经释放，物理上跨不过
+/// await。
+///
+/// 读失败按"关闭"处理。门闩的默认姿态是关的（成人源必须显式开启），反过来
+/// 在故障时放行等于门闩自己把自己打开了。
+fn adult_sources_allowed(state: &AppState) -> bool {
+    state
+        .database
+        .settings_get()
+        .map(|settings| settings.show_adult_sources)
+        .unwrap_or(false)
+}
+
+/// 目录/搜索类入口的门闩：算出**实际该用的**站源。
+///
+/// 返回 `None` 表示"这一路不该走 guo"，调用方据此回落到红果官网链路。
+///
+/// **为什么是静默回落而不是 Err**：这类入口的语义是"给我列个目录"，用户刚才
+/// 做的事只是选了一个源。前端在总开关关闭时本来就做了同款处理（选中的源被
+/// 隐藏就切回红果，见 `ExploreView`），后端做同样的事不改变任何 UI 观感；
+/// 反过来在这里 Err，界面会凭空多出一张"目录加载失败"的红卡片，而用户什么
+/// 都没做错——那是把一条内部策略暴露成了故障。
+///
+/// 命中时也要顺手改掉 `filter.source` 本身而不只是忽略它：下游
+/// `merge_search_sources` / `search_cache_key` 都读这个字段，留着它会让
+/// 缓存 key 变成"红果结果挂在帝果的 key 下"，切开关后立刻读到旧缓存。
+fn gated_source(source: Option<&str>, show_adult: bool) -> Option<String> {
+    let source = source?;
+    if !show_adult && guo_provider::source_is_adult(source) {
+        return None;
+    }
+    Some(source.to_owned())
+}
+
+/// 按 id 直达类入口（详情 / 封面 / 起播 / 画质）的门闩纯判定。
+///
+/// 与 [`gated_source`] 分成"静默回落"和"报错"两种，差别只在**用户此刻是不是
+/// 正在看被禁内容**：
+/// - 目录/搜索：用户只选了个源，列表里本就不该出现异常 → 静默回红果；
+/// - 直达：用户已经点开了某部被禁的剧，**报错才是正确结果**。静默回退在这里
+///   等于"我照播了但你看不见"，用户会以为是自己设备坏了；而播放这条一旦漏了
+///   守卫就是整个门闩唯一的实质失守点（绕过目录直接按 id 取流）。
+fn series_source_allowed(series_id: &str, show_adult: bool) -> bool {
+    show_adult || !guo_provider::source_is_adult(guo_provider::guo_source_of(series_id))
+}
+
+/// [`series_source_allowed`] 的命令侧封装：读设置 + 命中即 Err。
+fn ensure_series_source_allowed(series_id: &str, state: &AppState) -> Result<(), String> {
+    if series_source_allowed(series_id, adult_sources_allowed(state)) {
+        Ok(())
+    } else {
+        Err(ADULT_SOURCE_BLOCKED.to_owned())
+    }
+}
+
+/// 搜索结果缓存的存活期。
+///
+/// 5 分钟覆盖"切走再切回、退格重输同一个词、联想在首屏之后被单独补一次"这一段
+/// 操作（同一个词因此会被完整重跑 2~3 遍，其中 `catalog_suggest` 每次都要冷启动
+/// 一个 Python 进程，实测 0.6-1.9s）。再长就不划算了：目录与榜单是活的，5 分钟
+/// 前的搜索结果对用户已经没有新鲜度价值。
+const SEARCH_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// 缓存条目数上限。超限直接整表清空，不做 LRU：搜索词的基数极低（一个会话里
+/// 用户真搜过的词撑死几十个），128 条足够覆盖；为省一次整表清空去维护访问顺序
+/// 与链表，复杂度不划算。
+const SEARCH_CACHE_CAPACITY: usize = 128;
+
+/// 搜索结果缓存。只服务 `catalog_fast_search`（keyword 非空时）与 `catalog_suggest`。
+///
+/// **目录浏览（keyword 为空）绝不入缓存**：浏览要的是最新上架与实时排序，把旧页
+/// 缓存住等于让用户在一个已经陈旧的目录里翻页。
+///
+/// 锁是 `std::sync::Mutex` 且只在同步块内短暂持有（查/写完立刻释放），绝不跨
+/// `.await`：这些命令体里有多处 await 跨越点，跨 await 持锁会把 tokio 工作线程
+/// 串行化，缓存反而成了新的瓶颈。锁中毒时按"没有缓存"处理——缓存坏掉不该让
+/// 搜索失败。
+struct SearchCache<T> {
+    ttl: Duration,
+    entries: Mutex<HashMap<String, (Instant, T)>>,
+}
+
+impl<T: Clone> SearchCache<T> {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<T> {
+        let mut guard = self.entries.lock().ok()?;
+        let expired = matches!(
+            guard.get(key),
+            Some((stored_at, _)) if stored_at.elapsed() >= self.ttl
+        );
+        if expired {
+            // 顺手删掉过期条目：容量上限是硬清空，不主动回收的话过期值会一直占位。
+            guard.remove(key);
+            return None;
+        }
+        guard.get(key).map(|(_, value)| value.clone())
+    }
+
+    fn put(&self, key: String, value: T) {
+        let Ok(mut guard) = self.entries.lock() else {
+            return;
+        };
+        if guard.len() >= SEARCH_CACHE_CAPACITY {
+            guard.clear();
+        }
+        guard.insert(key, (Instant::now(), value));
+    }
+}
+
+static FAST_SEARCH_CACHE: OnceLock<SearchCache<CatalogPage>> = OnceLock::new();
+static SUGGEST_CACHE: OnceLock<SearchCache<Vec<SeriesItem>>> = OnceLock::new();
+
+fn fast_search_cache() -> &'static SearchCache<CatalogPage> {
+    FAST_SEARCH_CACHE.get_or_init(|| SearchCache::new(SEARCH_CACHE_TTL))
+}
+
+fn suggest_cache() -> &'static SearchCache<Vec<SeriesItem>> {
+    SUGGEST_CACHE.get_or_init(|| SearchCache::new(SEARCH_CACHE_TTL))
+}
+
+/// 搜索缓存的 key。所有会改变结果的参数都要编进来，漏一个就会串味：同一个词在
+/// drama / comic 两个频道下是两批完全不同的条目，page 更是不同切片。
+///
+/// 题材/受众/排序不进 key：网页搜索刻意不叠加这些筛选（见 provider 的搜索分支
+/// 注释），编进去只会把"带着题材去搜"的正常操作判成不同 key，白白丢掉缓存命中。
+/// 频道是硬条件：合并动漫源时它会被改写成 `anime`，两者的结果集并不相同。
+///
+/// 缓存是函数级的私有 statics，跨命令共用会把"含联想的 catalog_list 结果"和
+/// "不含联想的快速首屏"混成同一份，所以不按命令名分桶。
+fn search_cache_key(filter: &CatalogFilter, keyword: &str) -> String {
+    format!(
+        "fast|src={}|ch={}|kw={}|p={}|n={}",
+        filter.source.as_deref().unwrap_or_default(),
+        filter.channel,
+        keyword,
+        filter.page,
+        filter.page_size,
+    )
+}
+
+fn suggest_cache_key(keyword: &str, channel: &str) -> String {
+    format!("suggest|kw={keyword}|ch={channel}")
+}
+
+/// App 搜索接口一次取多少条。
+///
+/// 接口并不严格按 `count` 截断（实测 `count=10` 回了 13 条），所以这个值只是
+/// 上限提示；给 20 是为了让「烬九州」这类一搜就是一整组季的词尽量一次拿全，
+/// 少一次分页往返。
+const APP_SEARCH_LIMIT: usize = 20;
+
+/// `SeriesHit`（App 搜索接口的卡片）→ 前端 `SeriesItem`。
+///
+/// 与 `suggestion_to_item`（App 联想，走 Python worker 的 `search` 子命令）
+/// 分开的原因：两者 `origin` 文案必须不同。用户看到的卡片角标要能区分
+/// "搜索直连"与"联想补出来的"，排查搜索结果来源时才不会互相打架。
+pub(crate) fn app_search_hit_to_item(hit: SeriesHit, channel: &str) -> SeriesItem {
+    let intro = hit.intro.trim();
+    SeriesItem {
+        id: hit.id,
+        title: hit.title,
+        cover: hit.cover,
+        item_type: channel.to_owned(),
+        episodes_count: hit.episode_count,
+        latest_episode_title: None,
+        // App 搜索不给题材标签（`category_schema` 是结构描述、`rec_tags` 是
+        // 推荐位标签，都不是题材名）。宁可留空也不编：编出来的标签会污染
+        // 前端按题材筛选。
+        tags: Vec::new(),
+        origin: "红果 App 直连".into(),
+        brief: (!intro.is_empty()).then(|| intro.to_string()),
+        rating: None,
+    }
+}
+
+fn suggestion_to_item(
+    suggestion: crate::short_drama_app::SearchSuggestion,
+    channel: &str,
+) -> SeriesItem {
+    SeriesItem {
+        id: suggestion.id,
+        title: suggestion.title,
+        cover: suggestion.cover,
+        item_type: channel.to_owned(),
+        episodes_count: suggestion.episode_count,
+        latest_episode_title: None,
+        tags: suggestion.tags,
+        origin: "红果 App 联想".into(),
+        brief: None,
+        rating: None,
+    }
+}
+
+/// App 搜索这一路是否适用于当前频道。
+///
+/// 只有真人短剧档有 `tab_type=11`。漫剧/动漫**不能**接这一路：实测 aid=8662
+/// 的搜索索引是全局的，返回值里会混进 `content_type=1004/1007` 的漫剧条目，
+/// 硬接就会让「漫剧」频道搜出短剧卡片——串频道比搜不到更糟。
+fn app_search_applies(channel: &str) -> bool {
+    matches!(channel, "drama" | "short")
+}
+
+/// 四路搜索结果的合并结果。
+struct SearchMerge {
+    /// App 搜索 → 网页 → 动漫 → 联想，按 id 去重后的最终列表。
+    items: Vec<SeriesItem>,
+    /// App 搜索这一路是否失败：**唯一**决定 `degraded` 的信号。
+    app_failed: bool,
+    /// 动漫这一路是否失败：只影响 `source` 文案，不影响 `degraded`。
+    anime_failed: bool,
+}
+
+/// 把四路已取回的结果合并成最终列表。
+///
+/// 抽成纯函数是为了能单测：真正取数那层要 `AppHandle` / `AppState`，单测里造
+/// 不出来，而"位次、按 id 去重、未上架过滤"恰恰是这里最容易写错、又最该被
+/// 锁住的部分。
+///
+/// 位次含义：App 搜索是现在唯一能稳定返回结构化短剧卡片的来源，排第一；
+/// 网页是 SSR 恢复后的同位替代；动漫是补充来源；联想只补前面漏掉的分季条目。
+fn merge_search_results(
+    app_search: Result<Vec<SeriesHit>, String>,
+    web_items: Vec<SeriesItem>,
+    anime_items: Option<Vec<SeriesItem>>,
+    suggestions: Vec<crate::short_drama_app::SearchSuggestion>,
+    channel: &str,
+) -> SearchMerge {
+    let mut items: Vec<SeriesItem> = Vec::new();
+    let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut app_failed = false;
+
+    // 1) App 搜索（主结果来源）。
+    match app_search {
+        Ok(hits) => {
+            for hit in hits {
+                // 与网页那路同一条规则，但**各自独立**执行：`episode_cnt` 不足 1
+                // 的卡片一律丢——未上架的季点开是空详情，「盘点/合集」类内容卡
+                // 更是非线性剧集（实测 7661183456205947417 的详情回
+                // 101000 content_gone）。两路共用同一个判定函数会把两条不同
+                // 数据源的规则耦合在一起，改一边就悄悄改了另一边。
+                if hit.episode_count == 0 {
+                    continue;
+                }
+                if !existing.insert(hit.id.clone()) {
+                    continue;
+                }
+                items.push(app_search_hit_to_item(hit, channel));
+            }
+        }
+        Err(error) => {
+            app_failed = true;
+            // 只记日志不抛错：网页/动漫/联想仍可能给出结果，整次搜索不该因为它
+            // 失败而报错（用户会看到"搜索失败"而其实还有内容可看）。
+            crate::trace::log(format!("[搜索] App 搜索不可用：{error}"));
+        }
+    }
+
+    // 2) 网页（现在恒空，站点已 CSR；留着是为了 SSR 恢复时自动重新生效）。
+    for item in web_items {
+        if existing.insert(item.id.clone()) {
+            items.push(item);
+        }
+    }
+
+    // 3) 动漫。
+    let anime_failed = anime_items.is_none();
+    for item in anime_items.unwrap_or_default() {
+        if existing.insert(item.id.clone()) {
+            items.push(item);
+        }
+    }
+
+    // 4) App 联想（补齐前面漏掉的分季条目）。
+    for suggestion in suggestions {
+        let sid = suggestion.id.clone();
+        if existing.insert(sid) {
+            items.push(suggestion_to_item(suggestion, channel));
+        }
+    }
+
+    SearchMerge {
+        items,
+        app_failed,
+        anime_failed,
+    }
+}
+
+/// 多源搜索的合并链：红果 App 搜索（主）+ 红果网页（SSR 恢复即自动生效）
+/// + 动漫源 + 可选的 App 联想。
+///
+/// 四个来源并发：串行会让搜索凭空多等一次往返，而它们互不依赖。
+///
+/// 为什么在后端合并：搜索页此前只搜红果（channel 硬编码 drama），动漫共和国
+/// 的视频永远搜不到。动漫源失败只跳过——它是补充来源，不该让红果结果陪葬；
+/// 但会在 `source` 里留一句说明，避免用户把残缺结果当成全集。
+///
+/// 为什么网页那路留着：站点 2026-10 已改成纯 CSR——`/search/{keyword}` 返回的
+/// 只有 `<div id="root">` + 若干 `<script>`，`parse_router_data` 恒为 None，
+/// 这条路现在**恒返回 0 条**。但它没有删：站方哪天恢复 SSR / 重新塞回
+/// router data，这条路会自动复活且天然带题材与集数，比 App 接口信息更全。
+/// 删了就再也回不来了，成本只是一次并发的空请求。
+///
+/// `with_suggestions` 为什么是个开关：联想要冷启动一个 Python 进程（实测端到端
+/// 0.6-1.9s），而它只是补充。开着它，App 搜索结果 0.3s 就绪也要在 join! 里陪等
+/// 到 1s 以后——这正是"搜索慢"的主因。快速首屏传 false，联想由前端随后单独补齐。
+async fn merge_search_sources(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    filter: &CatalogFilter,
+    keyword: &str,
+    with_suggestions: bool,
+) -> Result<CatalogPage, String> {
+    if filter.channel == "ai" {
+        return state.provider.catalog(filter).await;
+    }
+    let comic = filter.channel == "comic";
+    let dmghg_filter = CatalogFilter {
+        keyword: Some(keyword.to_owned()),
+        channel: "anime".into(),
+        category: "全部".into(),
+        ..filter.clone()
+    };
+    // App 搜索只有 `tab_type=11`（真人短剧）这一档，判定见 `app_search_applies`。
+    let app_channel = filter.channel.clone();
+    let app_search_fut = async move {
+        if !app_search_applies(&app_channel) {
+            return Ok(Vec::new());
+        }
+        let client = crate::hongguo_bridge::client().await?;
+        client
+            .search(keyword, APP_SEARCH_LIMIT, 0)
+            .await
+            .map_err(|error| error.to_string())
+    };
+    let suggestions_fut = async {
+        if with_suggestions {
+            crate::short_drama_app::search_suggest(app, keyword, comic).await
+        } else {
+            Vec::new()
+        }
+    };
+    let (web, suggestions, anime, app_search) = tokio::join!(
+        state.provider.catalog(filter),
+        suggestions_fut,
+        async { state.anime_provider.catalog(&dmghg_filter).await },
+        app_search_fut,
+    );
+    // 网页那一路失败**不能**拖垮整次搜索。
+    //
+    // 旧写法是 `let mut page = web?;` —— 站点一次 503/超时就让整页搜索变成红字
+    // 错误，而那时 App 搜索可能已经拿到了十几条结果。现在主结果来源是 App 搜索
+    // （网页恒空，站点已改 CSR），网页只是"SSR 恢复后自动复活"的备用同位替代，
+    // 它挂了不该有任何可见后果：记一条日志，按空页继续合并。
+    let mut page = match web {
+        Ok(page) => page,
+        Err(error) => {
+            crate::trace::log(format!("[搜索] 网页搜索不可用（不影响 App 搜索）：{error}"));
+            CatalogPage {
+                items: Vec::new(),
+                total: 0,
+                has_more: false,
+                page: filter.page,
+                categories: Vec::new(),
+                next_cursor: None,
+                source: String::new(),
+                degraded: false,
+            }
+        }
+    };
+    let web_count = page.items.len();
+    // 动漫那一路失败只降级成 `None`：它是补充来源，不该让整次搜索报错。
+    let anime_items = match anime {
+        Ok(anime_page) => Some(anime_page.items),
+        Err(_) => None,
+    };
+    let suggest_missing = with_suggestions && suggestions.is_empty();
+    let merged = merge_search_results(
+        app_search,
+        std::mem::take(&mut page.items),
+        anime_items,
+        suggestions,
+        filter.channel.as_str(),
+    );
+
+    // 降级说明只写"确实失败"的来源，且只写给用户看的话（不泄露内部信息，不变量 12）。
+    if merged.anime_failed {
+        page.source = format!("{}；动漫来源暂不可用", page.source);
+    }
+    if merged.app_failed {
+        page.source = format!("{}；App 搜索暂不可用", page.source);
+    }
+    // App 联想的空列表**不作为降级信号**：联想失败与"这个词本来就没有联想"共用
+    // 同一个 Vec（search_suggest 内部吞掉错误），而动漫关键词天生没有 App 联想
+    // （联想恒走短剧档），照报就是纯噪音。只在已经有来源真的挂了、且手上确实留住了
+    // 结果时补一句"可重试"，让用户知道结果可能不全。
+    if (merged.app_failed || merged.anime_failed) && suggest_missing && !merged.items.is_empty() {
+        page.source = format!("{}；部分来源暂不可用，可重试", page.source);
+    }
+
+    // 降级判定收敛成一个具名布尔，供机器读。`source` 里的文案仍然照旧输出
+    // ——用户得知道"哪个来源不可用"，而 `degraded` 只回答"这次结果可不可信"，
+    // 两者互补，不该合成一个字段让前端去猜。
+    //
+    // 只认"来源真的挂了"：**App 搜索失败**（主结果来源，挂了等于用户看到残缺结果）
+    // **或动漫源失败**（它的条目整块缺席，同样是不全）。
+    // 网页那路恒空（站点已 CSR）**绝不能**算降级——算进去的话每次搜索都会亮
+    // 降级条，用户会学会无视它。联想空列表同理不算（失败与"本来就没有"不可分）。
+    page.degraded = merged.app_failed || merged.anime_failed;
+    // 网页那一路的条目已经计入 `page.total`，只把追加的部分加上去。
+    let added = merged.items.len().saturating_sub(web_count);
+    page.total = page.total.saturating_add(added);
+    page.items = merged.items;
+    Ok(page)
+}
+
+/// `force` 是**用户手动刷新**的唯一入口：只有它为 true 时才允许穿透站源缓存。
+///
+/// 背景（2026-10 用户报告「正在热播 / 新剧的刷新按钮点了没反应」）：19 个 guo
+/// 站源的目录走的是「缓存优先 + SWR」——TTL（15min）内直接回盘上缓存，过期则
+/// 立即回旧值、后台再刷新。于是这个刷新按钮对 guo 源是一个纯转圈的假动作：
+/// 发出的请求照样命中缓存，返回的与屏幕上已有的完全一致。红果与动漫两条链路
+/// 本来就是每次走网络，force 对它们无意义，这里不做分支。
+#[tauri::command]
+async fn catalog_list(
+    app: tauri::AppHandle,
+    mut filter: CatalogFilter,
+    force: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<CatalogPage, String> {
+    // 18+ 门闩：受控源被关掉时把 source 置空 → 静默回落红果（理由见 gated_source）。
+    filter.source = gated_source(filter.source.as_deref(), adult_sources_allowed(&state));
+    if let Some(source) = filter.source.as_deref() {
+        if source != "hongguo" {
+            // guo 调用是阻塞 FFI 且 guo-core 内部超时长达 60s（死源要跑满内部
+            // 重试），async 命令里直接调会占死一个 tokio worker。挪进
+            // spawn_blocking：worker 只在等 JoinHandle，阻塞池承压且可扩张。
+            let provider = state.guo_provider.clone();
+            let force = force.unwrap_or(false);
+            return tauri::async_runtime::spawn_blocking(move || {
+                if force {
+                    // 无视磁盘缓存直接拉一次（`force: true`），顺手把结果写回缓存
+                    // 供后续的缓存读预热。冷却中的源会 0ms 快速失败——手动刷新
+                    // 也不该把死源从冷却里放出来狂打。
+                    provider.catalog_refresh(&filter)
+                } else {
+                    provider.catalog(&filter)
+                }
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    // 黄果专区走独立数据源（隐藏频道，id 前缀 `hg:`），不与短剧目录共享链路。
+    // 刻意放在 guo 分支之后：那条按 source 判定，这条按 channel 判定，互不重叠。
+    if filter.channel == crate::huangguo::mapping::CHANNEL {
+        return state.huangguo_provider.catalog(&filter).await;
+    }
+    // 动漫专区走独立数据源（暴风资源），不与短剧目录共享链路。
+    if filter.channel == "anime" {
+        return state.anime_provider.catalog(&filter).await;
+    }
+    let Some(keyword) = keyword_of(&filter) else {
+        warm_theme_routes(&app, filter.page);
+        return state.provider.catalog(&filter).await;
+    };
+    merge_search_sources(&app, &state, &filter, &keyword, true).await
+}
+
+/// 搜索的"快速首屏"入口：只跑两个结构化来源，不等 App 联想。
+///
+/// 联想只是补齐分季条目，首屏不该为它付出一次 Python 冷启动。前端先调这里
+/// 把主结果画出来，再调 `catalog_suggest` 把联想追加到尾部。
+#[tauri::command]
+async fn catalog_fast_search(
+    app: tauri::AppHandle,
+    mut filter: CatalogFilter,
+    state: State<'_, AppState>,
+) -> Result<CatalogPage, String> {
+    // 同 catalog_list：门闩必须在缓存查表之前跑，否则受控源的搜索结果会以
+    // "红果的结果"回到同一个 key 上，切开关后仍能读到缓存里的旧内容。
+    filter.source = gated_source(filter.source.as_deref(), adult_sources_allowed(&state));
+    if let Some(source) = filter.source.as_deref() {
+        if source != "hongguo" {
+            // 同 catalog_list：spawn_blocking 承接可能长至 60s 的阻塞 FFI。
+            let provider = state.guo_provider.clone();
+            return tauri::async_runtime::spawn_blocking(move || provider.catalog(&filter))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    if filter.channel == crate::huangguo::mapping::CHANNEL {
+        return state.huangguo_provider.catalog(&filter).await;
+    }
+    if filter.channel == "anime" {
+        return state.anime_provider.catalog(&filter).await;
+    }
+    let Some(keyword) = keyword_of(&filter) else {
+        return state.provider.catalog(&filter).await;
+    };
+    // 只缓存带关键词的搜索：keyword 为空的那条是纯目录浏览，必须永远拿最新的。
+    let cache_key = search_cache_key(&filter, &keyword);
+    if let Some(hit) = fast_search_cache().get(&cache_key) {
+        return Ok(hit);
+    }
+    let page = merge_search_sources(&app, &state, &filter, &keyword, false).await?;
+    fast_search_cache().put(cache_key, page.clone());
+    Ok(page)
+}
+
+/// 只跑 App 搜索联想，返回可直接追加到结果尾部的条目。
+///
+/// 单独成一个命令是为了让它脱离首屏的关键路径（原因见 `merge_search_sources`）。
+/// 失败返回空数组：它是锦上添花的补充来源，不该让整次搜索报错。
+#[tauri::command]
+async fn catalog_suggest(
+    app: tauri::AppHandle,
+    keyword: String,
+    channel: String,
+) -> Result<Vec<SeriesItem>, String> {
+    let keyword = keyword.trim().to_owned();
+    if keyword.is_empty() {
+        return Ok(Vec::new());
+    }
+    let comic = channel == "comic";
+    let cache_key = suggest_cache_key(&keyword, &channel);
+    if let Some(hit) = suggest_cache().get(&cache_key) {
+        return Ok(hit);
+    }
+    // 联想失败与"没有联想"都得到空列表，这里一并缓存：前端在首屏之后还会对同一个
+    // 词再调一次，省下的正是那次 Python 冷启动（实测 0.6-1.9s）。代价是词源临时
+    // 不可用时空结果会挂 5 分钟，但用户多半已经看到完整首屏。
+    let items: Vec<SeriesItem> = crate::short_drama_app::search_suggest(&app, &keyword, comic)
+        .await
+        .into_iter()
+        .map(|suggestion| suggestion_to_item(suggestion, channel.as_str()))
+        .collect();
+    suggest_cache().put(cache_key, items.clone());
+    Ok(items)
+}
+
+/// 某部剧所属系列的**全部季**（App 里点开系列剧弹窗时的那份数据）。
+///
+/// 为什么必须单开一条命令：网页链路一次只露出「当前在推」的那一季，
+/// 《烬九州》35 季实测在搜索页只出 1 条；旧实现靠标题正则 + 每季一次回查，
+/// 上限 2 次（`SEARCH_SEASON_MAX_REQUESTS`），再多也补不出来。plan 接口
+/// 一次返回整组季，这才是"35 季全都在"的唯一来源。
+///
+/// 为什么不用先查 album_id：从该系列**任意一季**的 seriesId 进去，plan 都
+/// 返回整系列（实测从第 35 季的 id 进去同样拿到 35 条、index 1..35）。
+/// SDK 的 Go 版为了拿 related_album_id 多打了一次 GetSeries，我们省掉这一跳，
+/// 弹窗打开才够快。
+///
+/// 失败一律 `Err`，不吞成空数组：前端会退回旧链路，而吞空数组会把"网络/
+/// 设备挂了"伪装成"这剧只有一季"，用户就再也看不到其余季了。
+#[tauri::command]
+async fn catalog_series_seasons(series_id: String) -> Result<Vec<SeriesSeason>, String> {
+    let client = crate::hongguo_bridge::client().await?;
+    let seasons = client
+        .series_seasons(&series_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(seasons.into_iter().map(SeriesSeason::from).collect())
+}
+
+/// 搜索页的热搜（猜你想搜 + 各热搜榜）。
+///
+/// 只有 App 接口提供这组数据，网页源没有对应页面；失败返回 `Err` 让前端隐藏
+/// 该区块，而不是把"接口挂了"伪装成"今天没有热搜"。
+#[tauri::command]
+async fn hongguo_hot_search() -> Result<serde_json::Value, String> {
+    let client = crate::hongguo_bridge::client().await?;
+    let hot = client
+        .hot_search()
+        .await
+        .map_err(|error| error.to_string())?;
+    let item = |h: &crate::hongguo::catalog::HotItem| {
+        serde_json::json!({
+            "id": h.series.id,
+            "title": h.series.title,
+            "cover": h.series.cover,
+            "episodeCount": h.series.episode_count,
+            "heat": h.heat,
+        })
+    };
+    Ok(serde_json::json!({
+        "guesses": hot.guesses.iter().map(item).collect::<Vec<_>>(),
+        "boards": hot.boards.iter().map(|b| serde_json::json!({
+            "name": b.name,
+            "items": b.items.iter().map(item).collect::<Vec<_>>(),
+            "topics": b.topics.iter().filter(|t| !t.query.is_empty()).map(|t| serde_json::json!({
+                "title": t.title,
+                "heat": t.heat,
+                "query": t.query,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// 全站题材词表：题材栏的完整来源。
+///
+/// 目录分页只有一页 24 条，按页取词表会让题材栏随翻页/筛选变来变去，也拿不到
+/// 全站题材。这里由后端汇总全站索引后给出稳定全集；首次调用要建索引（约数秒），
+/// 前端应在首屏渲染完成后后台调用，不要挡住卡片。
+#[tauri::command]
+async fn catalog_categories(
+    channel: String,
+    source: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    // 题材词表同样会命中 18+ 源（"AI 短剧""国漫"这些分类名本身就是成人源的），
+    // 门闩漏在这里的话，受控源的题材词表会一直躺在前端题材栏里。
+    let source = gated_source(source.as_deref(), adult_sources_allowed(&state));
+    if let Some(source) = source.as_deref() {
+        if source != "hongguo" {
+            // 冷缓存时这里会真走网络（死源 25-60s），同 catalog_list 挪进阻塞池。
+            let provider = state.guo_provider.clone();
+            let source = source.to_owned();
+            return tauri::async_runtime::spawn_blocking(move || provider.categories(&source))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    // 黄果专区的「题材」就是它的四个频道，是一张编译期常量表，不走网络。
+    if channel == crate::huangguo::mapping::CHANNEL {
+        return Ok(crate::huangguo::mapping::category_names());
+    }
+    // 动漫专区是独立数据源，不参与红果目录索引。
+    if channel == "anime" {
+        return Ok(Vec::new());
+    }
+    state.provider.catalog_categories(&channel).await
+}
+
+#[tauri::command]
+async fn anime_qualities(
+    series_id: String,
+    episode_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::models::VideoQualityOption>, String> {
+    if crate::guo_provider::is_guo_id(&series_id) {
+        // 画质探测内部会真起一次 resolve（拿完档位就 release），它拿得到的是
+        // 这一集的档位元信息，所以按"直达"口径报错而不是回落。
+        ensure_series_source_allowed(&series_id, &state)?;
+        // resolve 同样是可能跑满 60s 内部超时的阻塞 FFI，同 catalog_list 处理。
+        let provider = state.guo_provider.clone();
+        return tauri::async_runtime::spawn_blocking(move || {
+            provider.qualities(&series_id, &episode_id)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    if crate::huangguo::mapping::is_huangguo_id(&series_id) {
+        return state
+            .huangguo_provider
+            .qualities(&series_id, &episode_id)
+            .await;
+    }
+    state
+        .anime_provider
+        .qualities(&series_id, &episode_id)
+        .await
+}
+
+/// guo 源的封面解析：返回本地缓存文件路径（前端 convertFileSrc 后呈现）。
+///
+/// cover 下载在 guo-core 侧最长 25 秒（首次还要过源站传输层、解密、校验），
+/// 同步命令跑在主线程上会把窗口整个卡住；async 命令里裸调又会占死 worker
+/// ——封面一页几十张，worker 全被占住时连毫不相干的 IPC 都会排队。挪进
+/// spawn_blocking：阻塞发生在专用阻塞池，worker 数量不受影响。
+#[tauri::command]
+async fn guo_cover(
+    series_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    // 封面也是内容：这条命令会带着源侧 Referer 去站点把图**下载到本地缓存**。
+    // 门闩漏在这里的表现最隐蔽——目录和详情都挡住了，列表里却还有一排 18+
+    // 缩略图（很可能是用户上次开着开关时留下的缓存图），等于没关。
+    ensure_series_source_allowed(&series_id, &state)?;
+    let provider = state.guo_provider.clone();
+    tauri::async_runtime::spawn_blocking(move || provider.cover(&series_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// 批量封面：一次 IPC 解析一屏的封面路径。
+///
+/// ## 为什么需要它（2026-10-24）
+///
+/// 前端原来是**每张卡一次 `guo_cover`**。一页 30 张卡 = 30 次 IPC + 30 次
+/// `spawn_blocking` 派发 + 30 次 FFI；而 Tauri 的每次 `invoke` 都要过一次
+/// 序列化与事件循环，这些固定开销叠加起来，在首屏上比真正的网络时间还显眼。
+/// 更要紧的是它**无法被排序**：谁先谁后完全取决于各卡的 IntersectionObserver
+/// 回调顺序，于是"用户真正在看的头几张"可能排在滚动区深处的卡片后面。
+///
+/// 批量接口把这一屏收成一次调用：后端按入参顺序解析，返回同序的
+/// `Option<String>` 数组。前端一次拿到整屏结果，逐卡 setState 即可。
+///
+/// ## 并发度为什么是 4
+///
+/// guo-core 的封面通道自己限并发（`nativeCoverCache.slots` = 4），并且有
+/// `pending` 去重。Rust 侧把并发开到正好等于这个数，既用满它、又不会把多余的任务
+/// 挤在它门口排队（那样只会让 `spawn_blocking` 池被无意义的等待占住）。
+/// 更高并发拿不到更多吞吐 —— 瓶颈是那 4 个槽位。
+///
+/// ## 门闩
+///
+/// 逐条过 `series_source_allowed`：受控源的那一条返回 `None` 而**不是**整批报错
+/// —— 一批里混着 18+ 与非 18+ 是常态（搜索、历史、收藏都会跨源），整批 Err 会让
+/// 一次混排把普通封面也一起弄丢。这与单条 `guo_cover` 的报错语义不同是有意的：
+/// 单条调用是"我就要这一张"，被拒必须说出来；批量是"这一屏尽量给我"，能给的给。
+#[tauri::command]
+async fn guo_cover_batch(
+    series_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Option<String>>, String> {
+    if series_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    /// 与 guo-core `nativeCoverCache.slots` 一致，见上方注释。
+    const COVER_CONCURRENCY: usize = 4;
+    let show_adult = adult_sources_allowed(&state);
+    let provider = state.guo_provider.clone();
+    // 门闩在进阻塞池之前算完：`adult_sources_allowed` 读一次库，不该在阻塞池里
+    // 每条都读一遍（那是 30 次 SQLite 查询）。
+    tauri::async_runtime::spawn_blocking(move || {
+        // 结果槽按**原始入参长度**开：被门闩拒掉的位置保留 `None`，其余按原下标
+        // 回填。这样返回值与 `series_ids` 严格同序，前端可以按下标对齐。
+        let total = series_ids.len();
+        let results: Vec<Option<String>> = vec![None; total];
+        // 门闩先过一遍：被拒的直接跳过（槽里已经是 None）。
+        let allowed: Vec<(usize, String)> = series_ids
+            .into_iter()
+            .enumerate()
+            .filter(|(_, series_id)| series_source_allowed(series_id, show_adult))
+            .collect();
+        if allowed.is_empty() {
+            return results;
+        }
+
+        // 固定 4 个 worker 从同一个下标游标取活：比 `chunks(4)` 好，因为每条耗时
+        // 差异很大（命中缓存 0ms、冷封面要下载），按块切会让某一块拖住整批。
+        let cursor = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slots = std::sync::Arc::new(std::sync::Mutex::new(results));
+        let workers = COVER_CONCURRENCY.min(allowed.len());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let provider = provider.clone();
+                let cursor = std::sync::Arc::clone(&cursor);
+                let slots = std::sync::Arc::clone(&slots);
+                let allowed = &allowed;
+                scope.spawn(move || loop {
+                    let index = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((slot, series_id)) = allowed.get(index) else {
+                        return;
+                    };
+                    // 单条失败只丢那一条：封面对列表是装饰，不该因为一张图把整屏打成空。
+                    let path = provider.cover(series_id).ok().flatten();
+                    if let Ok(mut guard) = slots.lock() {
+                        if let Some(cell) = guard.get_mut(*slot) {
+                            *cell = path;
+                        }
+                    }
+                });
+            }
+        });
+        std::sync::Arc::try_unwrap(slots)
+            .map(|mutex| mutex.into_inner().unwrap_or_default())
+            .unwrap_or_default()
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// 黄果封面：入参是**远端地址**，返回解密后的本地文件路径。
+///
+/// 与 `guo_cover` 的入参口径刻意不同：guo 那边只能按 id 让 guo-core 自己去查封面，
+/// 而黄果的列表响应里已经带着 `cover`，按 id 再查一次详情等于每张卡多一次往返。
+///
+/// 站点封面是 AES-128-CBC 密文且地址带时效签名，所以必须在这里解密 + 落盘，
+/// 交给前端的是稳定本地路径（`convertFileSrc` 后呈现）。失败返回 `None`。
+#[tauri::command]
+async fn huangguo_cover(
+    cover: String,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    Ok(state.huangguo_provider.cover(&cover).await)
+}
+
+/// 批量黄果封面：一次 IPC 解析一屏，返回值与入参严格同序。
+#[tauri::command]
+async fn huangguo_cover_batch(
+    covers: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Option<String>>, String> {
+    Ok(state.huangguo_provider.cover_batch(covers).await)
+}
+
+/// 19 个 guo 源的站源任务/健康度状态（go 侧 `nativeSourceStatus`，原样透传）。
+///
+/// 逐个源查而不是让 go 侧一次返回全部：`sourceStatus` 只吃一个 source。
+/// 它是纯内存读、不联网，19 次 FFI 都是微秒级，同步也不会卡窗口。
+///
+/// 入参用 `AppHandle` 而不是 `State<'_, AppState>`：Tauri 规定"参数里带引用的
+/// 异步命令必须返回 `Result`"，而这里的返回类型是前端契约定死的 `Vec<Value>`
+/// （不能是 `Result`，否则前端就得 try/catch 一个永远不会失败的值）。`AppHandle`
+/// 本身是 `'static` 的值、不带生命周期，正好绕开这条限制。
+#[tauri::command]
+async fn guo_source_status(app: tauri::AppHandle) -> Vec<serde_json::Value> {
+    app.state::<AppState>().guo_provider.source_status_all()
+}
+
+/// 源健康检查：起 `sourceJob`（`check` = 五步链路）并轮询到任务落地。
+///
+/// `sourceJob` 是**异步起任务**：go 侧 `startSourceTask` 登记完就
+/// `go runSourceTask(...)`，回给我们的只是 `running: true` 的初始状态；真正的
+/// 结果只能靠再查 `sourceStatus` 拿（`checkSource` 每跑完一步 publish 一次，
+/// `health.steps` 增量长出来，`running` 转 false 才是终态）。所以这里 1s 一次
+/// 轮询，最多 200 次（≈3 分 20 秒，比 go 侧 3 分钟的任务超时多留余量），等待用
+/// tokio 的 sleep 而不是 `thread::sleep`，不占住 async 执行器的 worker。
+/// 每轮都重新取一次 state，那把 `State` 借用不跨 `.await`。
+///
+/// 失败不返回 Err，统一包成带 `error` 的 Value：健康检查是"点一下看个结果"的
+/// 辅助操作，让它把整次 IPC 变成异常，前端反而更难写 UI。
+#[tauri::command]
+async fn guo_source_check(source: String, app: tauri::AppHandle) -> serde_json::Value {
+    if let Err(error) = app.state::<AppState>().guo_provider.source_check(&source) {
+        return serde_json::json!({ "error": error });
+    }
+    let mut status = serde_json::Value::Null;
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // 起锁在任何 await 之前就放掉了：那把 guo bridge 锁是全局单锁，
+        // 持锁等 1s 会把所有其它 guo 调用一起堵住。
+        let polled = app.state::<AppState>().guo_provider.source_status(&source);
+        match polled {
+            Ok(value) => {
+                let settled = crate::guo_provider::source_settled(&value);
+                status = value;
+                if settled {
+                    return status;
+                }
+            }
+            Err(error) => return serde_json::json!({ "error": error }),
+        }
+    }
+    // 3 分钟还没落地：把当前这份（`running` 仍为 true、`steps` 可能只走了一半）
+    // 交回去，前端按 `running` 判断是"还在跑"还是"已结束"。
+    status
+}
+
+/// guo 源的网络模式：`direct` 直连 / `auto` 跟随系统代理。
+///
+/// 这是设置页「站源网络」开关的后端。真实状态存放在 guo-core 自己的
+/// resource-settings.json（saveResourceSettings 热应用 + 持久化），TTV 侧不存
+/// 第二份——否则两份状态必然漂移。
+#[tauri::command]
+async fn guo_proxy_get(app: tauri::AppHandle) -> Result<String, String> {
+    app.state::<AppState>().guo_provider.proxy_mode()
+}
+
+#[tauri::command]
+async fn guo_proxy_set(mode: String, app: tauri::AppHandle) -> Result<(), String> {
+    app.state::<AppState>().guo_provider.set_proxy_mode(&mode)
+}
+
+#[tauri::command]
+async fn series_detail(
+    series_id: String,
+    channel: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<SeriesDetail, String> {
+    if crate::guo_provider::is_guo_id(&series_id) {
+        // 按 id 直达：剧集已经在手上了，回落红果只会拿一部同 id 的别的剧，
+        // 所以这里必须报错。
+        ensure_series_source_allowed(&series_id, &state)?;
+        // detail 对死源要陪 guo-core 跑满 60s 内部超时，同 catalog_list 挪进阻塞池。
+        let provider = state.guo_provider.clone();
+        return tauri::async_runtime::spawn_blocking(move || provider.detail(&series_id))
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    if crate::huangguo::mapping::is_huangguo_id(&series_id) {
+        return state.huangguo_provider.detail(&series_id).await;
+    }
+    // 动漫项按 id 前缀判定，而不是只看 channel：前端的 channelBySeriesId 是内存
+    // Map，页面重载 / HMR 后为空（从收藏、历史进入时也不会填），此时 channel 缺失，
+    // 动漫 id 会掉进普通短剧链路——`dmghg:` 那种会被 provider 的数字 id 校验拒掉，
+    // 表现为「剧集 ID 无效。」；而暴风的裸数字 id 会**通过**校验，进而撞号查到红果
+    // 同 id 的剧，实测表现为「标题是别人的、共 0 集全、选集全空」（比直接报错更难查）。
+    // id 本身已经携带来源（`dmghg:` / `bfzy:`），用它判定最稳。
+    if channel.as_deref() == Some("anime") || crate::anime_provider::is_anime_id(&series_id) {
+        return state.anime_provider.detail(&series_id).await;
+    }
+    state.provider.detail(&series_id, channel.as_deref()).await
+}
+
+/// VSR 播放链路开关（设置页「播放体验 → RTX VSR 视频增强」）。
+///
+/// 为什么用进程级 `AtomicBool` 而不是 `AppState` 字段：
+/// `enhance_short_drama_session` 是自由函数，两处调用点（`playback_open` 的 guo
+/// 分支与红果分支）手里只有 `session`。改成收 `&AppState` 意味着起播热路径上多传
+/// 一个参数，而 `adult_sources_allowed` 那种「每次读库」的写法会把 SQLite 连接锁
+/// 拖进起播路径。AtomicBool 单字读、无锁、不跨 await，开销可忽略，且天然满足
+/// 「settings_save 后立刻生效、无需重启」。
+///
+/// 默认 `true`：进程刚起、`setup` 还没把落库值灌进来之前若已有起播，行为必须与
+/// 旧版本（默认走 VSR）一致，不能因初始化时序让首播悄悄降级。
+pub(crate) fn vsr_enabled() -> &'static AtomicBool {
+    static VSR_ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+    VSR_ENABLED.get_or_init(|| AtomicBool::new(true))
+}
+
+/// 供其它模块读取的布尔视图（跨模块只暴露 bool，不把 AtomicBool 泄漏出去）。
+pub(crate) fn vsr_is_enabled() -> bool {
+    vsr_enabled().load(Ordering::Relaxed)
+}
+
+/// 落库值 → 运行期开关。`setup`（启动）与 `settings_save`（改设置）各调一次。
+pub(crate) fn set_vsr_enabled(enabled: bool) {
+    vsr_enabled().store(enabled, Ordering::Relaxed);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 视频补帧：**独立窗口**方案
+//
+// 为什么不是就地补帧：WebView2 窗口无法被补帧链路捕获 —— DXGI / WGC 抓出来是
+// 整屏黑，GDI 抓取直接让引擎 0xC0000005 崩溃（三种 captureApi 都实测过）。
+// 所以补帧必须由一个自己的 D3D11 窗口承载：本模块只负责它的进程生命周期，
+// 渲染与补帧逻辑全在那个窗口里（realtime/LsfgDemo）。
+//
+// 与 VSR 的关系：VSR 作用在 WebView2 的 <video> 上（NVIDIA 驱动 + 本地 H.264 分片），
+// 补帧窗口走自绘 D3D11 呈现，**不经过驱动 VSR 那条路径**，两者不能叠加。
+// ───────────────────────────────────────────────────────────────────────────
+
+fn frame_interp_process() -> &'static Mutex<Option<std::process::Child>> {
+    static P: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(None))
+}
+
+/// 关掉补帧窗口（幂等）。退出应用、关开关都走这里。
+pub(crate) fn frame_interp_stop() {
+    let mut guard = frame_interp_process()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(mut child) = guard.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+// ── 原生播放器（mpv + LSFG 补帧，单窗口）─────────────────────────────────────
+//
+// 与 `frame_interp_*`（旧方案：LsfgDemo 无边框窗口盖在 WebView2 播放器上）的区别：
+// 新方案把视频渲染搬进播放器自己的 D3D11 swapchain，补帧在同一个窗口内完成，
+// 不再有第二个 HWND；同时直吃红果直链，整条 H.264 转码链路消失。
+
+/// 打开原生播放器播放一集（已在播则只换集）。
+#[tauri::command]
+async fn native_player_open<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    input: serde_json::Value,
+) -> Result<native_player::PlayerState, String> {
+    native_player::ensure_native_player_available()?;
+    native_player::open(app, input).await
+}
+
+/// 给原生播放器下发控制命令（pause/play/seek/volume/speed/fg/quit）。
+#[tauri::command]
+fn native_player_send(command: serde_json::Value) -> Result<(), String> {
+    native_player::ensure_native_player_available()?;
+    native_player::send(command)
+}
+
+/// 运行时替换联播队列（契约 §3.1 的 `queue`；`items` 为空等价于 `queueClear`）。
+///
+/// 入参 {items:[{url,key,title,ep,total,vw,vh,start,index}], index, autoplay, autoplayDelay}。
+/// 队列本身由 native_player 模块在进程内持有 —— 命令层只负责转发/取状态，
+/// 不在这里缓存任何一份，否则播放器重启后会出现两套队列。
+#[tauri::command]
+fn native_player_queue(input: serde_json::Value) -> Result<native_player::PlayerState, String> {
+    native_player::ensure_native_player_available()?;
+    native_player::queue(input)
+}
+
+/// `requestNext` 的回执：前端解析好下一集直链后推一条队列项进来。
+///
+/// 为什么需要这条命令：Rust 不持有剧集列表，播放器要下一集时只能问前端
+/// （事件 `native-player-need-next`），前端解析完直链从这里推回来，
+/// Rust 把它当 load 直接下发（契约 §3.3 "收到 load 即视为成功"）。
+#[tauri::command]
+fn native_player_queue_push(item: serde_json::Value) -> Result<native_player::PlayerState, String> {
+    native_player::ensure_native_player_available()?;
+    native_player::push_next(item)
+}
+
+/// 应用主题变化 → 已打开的原生播放器窗口（契约：原生窗口跟随**应用**主题）。
+///
+/// 入参 `mode` 是前端 `theme.ts` 解析后的实际模式（light/dark）或 `auto`。
+/// 没有播放器时**返回 false 而不是报错**：主题同步是旁路，不是播放链路的一部分。
+#[tauri::command]
+fn native_player_theme(mode: String) -> bool {
+    native_player::apply_theme(&mode)
+}
+
+/// 查询原生播放器状态（位置/时长/是否存活）。
+#[tauri::command]
+fn native_player_status() -> native_player::PlayerState {
+    native_player::status()
+}
+
+/// 关闭原生播放器窗口。
+#[tauri::command]
+fn native_player_close() {
+    native_player::stop();
+}
+
+/// 找补帧程序：优先随包资源，其次本地构建产物（开发态）。
+fn find_frame_interp_exe(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    if let Ok(dir) = app.path().resource_dir() {
+        let p = dir.join("lsfg").join("LsfgDemo.exe");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Some(dev) = std::env::var_os("TTV_LSFG_EXE").map(std::path::PathBuf::from) {
+        if dev.exists() {
+            return Some(dev);
+        }
+    }
+    None
+}
+
+/// 把本地 HLS 服务地址映射回磁盘文件。
+///
+/// 前端拿到的是 `http://127.0.0.1:<port>/rtx/<n>/vid-<id>/index.m3u8?token=...`，
+/// 而 **ffmpeg 打不开这条地址**（实测：curl 200 且内容正确，ffmpeg 一律报
+/// `Invalid data found when processing input`，与 UA / allowed_extensions 无关）。
+/// 但同一份产物在磁盘上，ffmpeg 读本地文件完全正常 —— 直接映射回路径最稳。
+fn local_stream_path(url: &str) -> Option<std::path::PathBuf> {
+    let vid = url.split("/vid-").nth(1)?;
+    let id: String = vid.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if id.is_empty() {
+        return None;
+    }
+    let base = crate::short_drama_app::cache_dir().join("rtx-vsr");
+    let dir = base.join(format!("vid-{id}"));
+    let m3u8 = dir.join("index.m3u8");
+    if m3u8.exists() {
+        Some(m3u8)
+    } else {
+        None
+    }
+}
+
+/// 开/关补帧窗口。返回 true 表示窗口已启动。
+///
+/// `hls_url` 是前端当前正在播的地址（本地 HLS 或直链），补帧窗口自己用 ffmpeg
+/// 边解边播，不依赖主窗口。
+// 参数是前端一次量到的窗口矩形与起播参数，天然就是这么多；聚合成 struct
+// 只会换来一次额外的序列化层，不值得。
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+fn frame_interp_set(
+    app: tauri::AppHandle,
+    hls_url: Option<String>,
+    enabled: bool,
+    multiplier: Option<u32>,
+    rect_x: Option<f64>,
+    rect_y: Option<f64>,
+    rect_w: Option<f64>,
+    rect_h: Option<f64>,
+    start_seconds: Option<f64>,
+) -> Result<bool, String> {
+    frame_interp_stop();
+    if !enabled {
+        return Ok(false);
+    }
+    let raw_url =
+        hls_url.ok_or_else(|| "当前会话还没有可用的流地址（先起播再开补帧）".to_string())?;
+    // 优先用磁盘上的同一份产物；映射失败才退回原始地址。
+    let url = match local_stream_path(&raw_url) {
+        Some(p) => p.to_string_lossy().to_string(),
+        None => raw_url,
+    };
+    let exe = find_frame_interp_exe(&app)
+        .ok_or_else(|| "补帧程序未安装（找不到 LsfgDemo.exe）".to_string())?;
+    let mult = multiplier.unwrap_or(2).clamp(2, 5);
+
+    // 把前端量到的「视频区域」（CSS 像素，相对客户区）换算成屏幕像素：
+    // 补帧窗口无边框盖在这块矩形上，观感就是"在原播放器里补帧"。
+    let win = app
+        .get_webview_window("main")
+        .ok_or_else(|| "找不到主窗口".to_string())?;
+    let scale = win.scale_factor().map_err(|e| e.to_string())?;
+    let inner = win.inner_position().map_err(|e| e.to_string())?;
+
+    let cx = rect_x.unwrap_or(0.0);
+    let cy = rect_y.unwrap_or(0.0);
+    let mut cw = rect_w.unwrap_or(0.0);
+    let mut ch = rect_h.unwrap_or(0.0);
+    if cw < 64.0 || ch < 64.0 {
+        // 前端没量到（比如舞台还没挂载）：退化成整窗覆盖。
+        let size = win.inner_size().map_err(|e| e.to_string())?;
+        cw = size.width as f64 / scale;
+        ch = size.height as f64 / scale;
+    }
+
+    let px = inner.x + (cx * scale).round() as i32;
+    let py = inner.y + (cy * scale).round() as i32;
+    let pw = ((cw * scale).round() as i32).max(320);
+    let ph = ((ch * scale).round() as i32).max(240);
+
+    // 补帧按 16:9 处理，高度扣掉控制条；宽度取偶数（D3D 纹理要求）
+    let bar_h = 46;
+    let video_w = (pw / 2) * 2;
+    let video_h = (((ph - bar_h) / 2) * 2).max(240);
+
+    let child = std::process::Command::new(&exe)
+        .arg("--hls")
+        .arg(&url)
+        .arg("--size")
+        .arg(format!("{video_w}x{video_h}"))
+        .arg("--fps")
+        .arg("30")
+        .arg("--mult")
+        .arg(mult.to_string())
+        .arg("--start")
+        .arg(format!("{:.2}", start_seconds.unwrap_or(0.0).max(0.0)))
+        .arg("--borderless")
+        .arg("--x")
+        .arg(px.to_string())
+        .arg("--y")
+        .arg(py.to_string())
+        .spawn()
+        .map_err(|e| format!("启动补帧窗口失败：{e}"))?;
+    *frame_interp_process()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(child);
+    Ok(true)
+}
+
+/// 非动漫链路统一转成 H.264 分片流。失败保留原 URL，由前端既有备份链路播放。
+async fn enhance_short_drama_session(session: PlaybackSession) -> PlaybackSession {
+    enhance_short_drama_session_keyed(session, None).await
+}
+
+/// 带缓存键的增强链路：guo 外部站源的起播走这条。
+///
+/// 键由「源|剧|集|档位」组成，由 `media_enhance::start_keyed_cache` 哈希成持久目录
+/// （`rtx-vsr/vid-guo-<hash>`）。不含播放地址：guo 的地址每次 resolve 都带新的本地
+/// token，拿地址当键永远命中不了；而同一集的内容在短时间内不会变，剧集 id 才是
+/// 稳定的身份。
+///
+/// 传 `None` 时行为与原来完全一致（红果另有自己的 `start_video_cache` 链路，
+/// 这里只服务 guo / 公开直链这类没有官方 vid 的源）。
+async fn enhance_short_drama_session_keyed(
+    mut session: PlaybackSession,
+    cache_key: Option<String>,
+) -> PlaybackSession {
+    if session.preview_only {
+        return session;
+    }
+    // 开关关闭：完全回到引入 `media_enhance` 之前的旧链路——原始源 URL 直接播，
+    // 不做任何 HTTP(S) 转码。这条判定必须排在 `needs_enhancement` **之前**：
+    // 后者只按 URL 形态决定「能不能转」，与用户开不开增强无关。
+    if !vsr_enabled().load(Ordering::Relaxed) {
+        // 开关自身也要留证：用户报"开关没用"时，第一件事就是确认此刻读到的值。
+        crate::trace::log(format!(
+            "[vsr] 开关=关，会话 {} 跳过增强，直接用原流 {}",
+            session.session_id,
+            crate::trace::redact_url(&session.url)
+        ));
+        return session;
+    }
+    if !media_enhance::needs_enhancement(&session.url) {
+        crate::trace::log(format!(
+            "[vsr] 开关=开但源不是 http(s)（{}），走原链路",
+            crate::trace::redact_url(&session.url)
+        ));
+        return session;
+    }
+    let started = match cache_key.as_deref() {
+        Some(key) => {
+            media_enhance::start_keyed_cache(session.session_id, key, &session.url, None).await
+        }
+        None => media_enhance::start(session.session_id, &session.url).await,
+    };
+    match started {
+        Ok(enhanced_url) => {
+            session.backup_url = Some(session.backup_url.unwrap_or_else(|| session.url.clone()));
+            session.url = enhanced_url;
+            session.stream_kind = Some("hls".to_owned());
+        }
+        Err(error) => crate::trace::log(format!("[vsr] 增强转码未启动，回退原流：{error}")),
+    }
+    session
+}
+
+#[tauri::command]
+async fn playback_open(
+    input: PlaybackOpenInput,
+    state: State<'_, AppState>,
+) -> Result<PlaybackSession, String> {
+    if crate::guo_provider::is_guo_id(&input.series_id) {
+        // **整个门闩最重要的一条**：这是"绕过目录、直接按 id 取流"的入口。
+        // 前端过滤、源选择器、神秘小窝 tab 全是 UI 层的，命令行里一次
+        // `invoke('playback_open', {input:{seriesId:'guo:dsd:…'}})` 就能绕开
+        // 它们全部——目录被挡住时用户手里仍然可能攥着一条旧 id（历史、收藏、
+        // 复制来的链接），那正是这条命令存在的理由。
+        ensure_series_source_allowed(&input.series_id, &state)?;
+        let provider = state.guo_provider.clone();
+        let series_id = input.series_id.clone();
+        let episode_id = input.episode_id.clone();
+        let quality = input.quality.clone();
+        let session_id = input.session_id;
+        let position = input.position;
+        let opened = tauri::async_runtime::spawn_blocking(move || {
+            provider.open_episode(session_id, &series_id, &episode_id, &quality, position)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        // 同一部剧的同一集、同一档位共用一个产物目录：回看、画中画交接、连播预取
+        // 命中已转好的整集 HLS 就直接出画，与红果的 `vid-<vid>` 缓存同一套语义。
+        let cache_key = format!(
+            "guo|{}|{}|{}",
+            opened.series_id, opened.episode_id, opened.quality
+        );
+        let session = enhance_short_drama_session_keyed(opened, Some(cache_key)).await;
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "播放会话锁不可用。".to_string())?;
+        sessions.retain(|id, _| *id >= session.session_id.saturating_sub(8));
+        sessions.insert(session.session_id, session.clone());
+        return Ok(session);
+    }
+    // 黄果专区：streams.main 是标准 AES-128 HLS，经 hls_proxy 转本地流。
+    // 与动漫同样按 id 前缀兜底，不依赖前端的 isAnime / channel 记忆。
+    // 不做 VSR 增强：这条链路是 HLS，与动漫一致走原生播放路径。
+    if crate::huangguo::mapping::is_huangguo_id(&input.series_id) {
+        let session = state
+            .huangguo_provider
+            .open_episode(
+                input.session_id,
+                &input.series_id,
+                &input.episode_id,
+                &input.quality,
+                input.position,
+            )
+            .await?;
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "播放会话锁不可用。".to_string())?;
+        sessions.retain(|id, _| *id >= session.session_id.saturating_sub(8));
+        sessions.insert(session.session_id, session.clone());
+        return Ok(session);
+    }
+    // 动漫播放走动漫源直链（m3u8 与非 https 经本地 HLS 代理），不经红果 worker。
+    // 同样按 id 前缀兜底：前端 isAnime 来自 detail.type，链条上任一环缺失就会漏判。
+    if input.is_anime || crate::anime_provider::is_anime_id(&input.series_id) {
+        let session = state
+            .anime_provider
+            .open_episode(
+                input.session_id,
+                &input.series_id,
+                &input.episode_id,
+                input.position,
+                &input.quality,
+            )
+            .await?;
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "播放会话锁不可用。".to_string())?;
+        sessions.retain(|id, _| *id >= session.session_id.saturating_sub(8));
+        sessions.insert(session.session_id, session.clone());
+        return Ok(session);
+    }
+    let session = enhance_short_drama_session(
+        state
+            .provider
+            .open_episode(
+                input.session_id,
+                &input.series_id,
+                &input.episode_id,
+                &input.quality,
+                input.position,
+            )
+            .await?,
+    )
+    .await;
+    let mut sessions = state
+        .sessions
+        .lock()
+        .map_err(|_| "播放会话锁不可用。".to_string())?;
+    sessions.retain(|id, _| *id >= session.session_id.saturating_sub(8));
+    sessions.insert(session.session_id, session.clone());
+    Ok(session)
+}
+
+#[tauri::command]
+fn playback_command(
+    session_id: u64,
+    action: String,
+    _payload: Option<serde_json::Value>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if action == "stop" {
+        media_enhance::stop(session_id);
+        state.guo_provider.release(session_id);
+    }
+    let sessions = state
+        .sessions
+        .lock()
+        .map_err(|_| "播放会话锁不可用。".to_string())?;
+    if sessions.contains_key(&session_id) {
+        Ok(())
+    } else {
+        Err("播放会话已过期，请重新打开剧集。".into())
+    }
+}
+
+#[tauri::command]
+fn playback_snapshot(
+    session_id: u64,
+    state: State<'_, AppState>,
+) -> Result<PlaybackSnapshot, String> {
+    let sessions = state
+        .sessions
+        .lock()
+        .map_err(|_| "播放会话锁不可用。".to_string())?;
+    let session = sessions
+        .get(&session_id)
+        .ok_or_else(|| "播放会话已过期，请重新打开剧集。".to_string())?;
+    Ok(PlaybackSnapshot {
+        session_id,
+        state: PlaybackUiState {
+            kind: "opening".into(),
+            session_id,
+        },
+        position: session.position,
+        duration: 0.0,
+        buffered: 0.0,
+        volume: 1.0,
+        muted: false,
+        playback_rate: 1.0,
+    })
+}
+
+/// 读历史。**必须是 async**：同步命令会被 Tauri 放到窗口主线程上执行，
+/// SQLite 查询于是和渲染抢同一根线程（详见 `AppState::database` 的注释）。
+#[tauri::command]
+async fn history_list(state: State<'_, AppState>) -> Result<Vec<WatchHistoryItem>, String> {
+    let database = std::sync::Arc::clone(&state.database);
+    tauri::async_runtime::spawn_blocking(move || database.list_history())
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// 进全屏前窗口的"常规位置"（即标题栏"向下还原"的目标矩形）。
+///
+/// `window_prepare_fullscreen` 为做到"原地解除最大化、无还原动画"，会把常规位置
+/// 覆盖成最大化时的**整屏矩形**；不暂存原值的话，Windows 的还原目标从此就是整屏，
+/// 退出全屏后"向下还原"永远还原回整屏大小（放大缩小一个样，原始尺寸只能靠拖边
+/// 或重启找回）。退出全屏时由 `window_finish_fullscreen` 取走写回——两端必须成对。
+#[cfg(windows)]
+static PRE_FULLSCREEN_NORMAL_RECT: Mutex<Option<windows_sys::Win32::Foundation::RECT>> =
+    Mutex::new(None);
+
+/**
+ * 进全屏前，**静默**解除窗口的最大化状态。
+ *
+ * ## 为什么需要这个命令（而不是直接调 unmaximize）
+ *
+ * 窗口处于最大化时进全屏会出错：tao（wry 0.35 的 `window.rs`，WM_NCCALCSIZE 分支）
+ * 为了保证"无边框窗口最大化时不盖住任务栏"，会把**仍是最大化状态**的窗口客户区
+ * 裁到工作区（屏幕减任务栏）。而 `set_fullscreen` 只改全屏标记、从不清除最大化，
+ * 于是用户看到"进了全屏，任务栏还在、画面没铺满"。
+ *
+ * 解除最大化确实能解决它，但 tao 的 `set_maximized(false)` 走的是
+ * `ShowWindow(SW_RESTORE)`——**带系统还原动画**，窗口会先缩回原始尺寸再撑成全屏，
+ * 用户看到的就是"进全屏时回弹一下"，观感很怪。
+ *
+ * 这里改用 `SetWindowPlacement`：把显示状态改回 `SW_SHOWNORMAL`，同时把
+ * "常规位置"设成**当前（最大化时的）矩形**。窗口因此原地不动、无动画，只是不再
+ * 处于最大化状态——tao 的裁切随之失效，紧接着的 `set_fullscreen(true)` 就能
+ * 一步铺满整屏。
+ */
+#[cfg(windows)]
+#[tauri::command]
+fn window_prepare_fullscreen(window: tauri::Window) -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::{HWND, RECT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, SetWindowLongPtrW,
+        SetWindowPlacement, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_SHOWNORMAL, WINDOWPLACEMENT, WS_MAXIMIZE,
+    };
+
+    let hwnd: HWND = window.hwnd().map_err(|error| error.to_string())?.0;
+
+    unsafe {
+        let mut placement = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        if GetWindowPlacement(hwnd, &mut placement) == 0 {
+            return Err("读取窗口位置失败。".into());
+        }
+        // 「退出全屏回弹」的排查依据（2026-10 用户报告）。
+        // 回弹只有两种可能来源，日志能把它们分开：
+        //   a) 矩形真的跳变 —— prepare 前/后两个矩形不一致；
+        //   b) 矩形没变但窗口被系统播放了最大化过渡动画 —— 三个矩形完全一致。
+        crate::trace::log(format!(
+            "[窗口] prepare 前 状态={} 常规矩形={}x{}@({},{})",
+            placement.showCmd,
+            placement.rcNormalPosition.right - placement.rcNormalPosition.left,
+            placement.rcNormalPosition.bottom - placement.rcNormalPosition.top,
+            placement.rcNormalPosition.left,
+            placement.rcNormalPosition.top
+        ));
+        // 没最大化就不用管（例如窗口本来就只是普通尺寸）。
+        if placement.showCmd != SW_MAXIMIZE as u32 {
+            return Ok(false);
+        }
+
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return Err("读取窗口矩形失败。".into());
+        }
+
+        // 1) 摘掉 WS_MAXIMIZE：窗口不再是"最大化窗口"，tao 的任务栏裁切随之失效。
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_MAXIMIZE as isize));
+
+        // 2) 显示状态改回普通，但"常规位置"保持当前矩形——窗口原地不动，无动画。
+        //    覆盖前先把真实的还原矩形暂存起来（此刻 placement 里还是进全屏前的值），
+        //    退出全屏时由 window_finish_fullscreen 写回；不写回，"向下还原"的目标
+        //    就永远是整屏——用户看到的"最大化/还原按钮放大缩小一样大"正是这个。
+        if let Ok(mut stash) = PRE_FULLSCREEN_NORMAL_RECT.lock() {
+            *stash = Some(placement.rcNormalPosition);
+        }
+        placement.showCmd = SW_SHOWNORMAL as u32;
+        placement.rcNormalPosition = rect;
+        if SetWindowPlacement(hwnd, &placement) == 0 {
+            return Err("应用窗口位置失败。".into());
+        }
+
+        crate::trace::log(format!(
+            "[窗口] prepare 后 状态={} 当前矩形={}x{}@({},{}) 常规矩形={}x{}@({},{})",
+            placement.showCmd,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            rect.left,
+            rect.top,
+            placement.rcNormalPosition.right - placement.rcNormalPosition.left,
+            placement.rcNormalPosition.bottom - placement.rcNormalPosition.top,
+            placement.rcNormalPosition.left,
+            placement.rcNormalPosition.top
+        ));
+
+        // 3) 让非客户区重新计算：客户区立刻按"非最大化"的规则铺满，不必等下一次窗口变化。
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn window_prepare_fullscreen(_window: tauri::Window) -> Result<bool, String> {
+    Ok(false)
+}
+
+/**
+ * 退出全屏的收尾：写回 `window_prepare_fullscreen` 暂存的还原矩形，并直接以
+ * 最大化状态显示。返回是否做了这件事。
+ *
+ * ## 为什么不能让前端在退出全屏后直接 `maximize()`
+ *
+ * prepare 阶段为"原地解除最大化"把"常规位置"覆盖成了整屏矩形，此后 Windows 的
+ * 还原目标就是整屏——前端若直接最大化，标题栏的"向下还原"会把窗口还原回整屏
+ * 大小，放大缩小一个样，原始窗口尺寸只能靠拖边或重启找回（2026-10 用户报告：
+ * "最大化/还原按钮放大缩小都一样大"）。这里先把暂存的矩形写回
+ * `rcNormalPosition` 再最大化，还原尺寸就接回来了。
+ *
+ * `SetWindowPlacement` 一次带 `SW_MAXIMIZE`：窗口从"普通状态的整屏矩形"直接进入
+ * 最大化，没有"先缩回原尺寸再撑开"的中间帧。返回 false 表示没有暂存（进全屏前
+ * 本来就没最大化，或走了 unmaximize 回退——那条路不覆盖还原矩形），前端按普通
+ * 路径自行最大化即可。
+ */
+#[cfg(windows)]
+#[tauri::command]
+fn window_finish_fullscreen(window: tauri::Window) -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::{HWND, RECT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, IsZoomed, SetWindowLongPtrW,
+        SetWindowPlacement, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+        SWP_NOZORDER, SW_MAXIMIZE, WINDOWPLACEMENT, WS_MAXIMIZE,
+    };
+
+    let stash = PRE_FULLSCREEN_NORMAL_RECT
+        .lock()
+        .map_err(|_| "读取全屏前状态失败。".to_string())?
+        .take();
+    let Some(original_rect) = stash else {
+        return Ok(false);
+    };
+
+    let hwnd: HWND = window.hwnd().map_err(|error| error.to_string())?.0;
+
+    unsafe {
+        let mut placement = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        if GetWindowPlacement(hwnd, &mut placement) == 0 {
+            return Err("读取窗口位置失败。".into());
+        }
+        // 收尾前后各读一次真实矩形：这两行合起来回答「退出全屏后到底有没有弹」。
+        // 进入前 = 退出全屏瞬间（tao 已把窗口恢复成普通状态的整屏矩形）；
+        // 收尾后 = 写回还原矩形并以最大化显示之后。两者的尺寸差就是用户看到的那一下。
+        let mut before_rect = RECT::default();
+        GetWindowRect(hwnd, &mut before_rect);
+
+        // 【2026-10 用户第二次报告"退出全屏先缩小、再放大、才回到原位置"】
+        // 日志实测把这个动作拆成了三次尺寸变化：
+        //   2560x1537（tao 撤掉全屏后的普通铺满态，与全屏几乎同尺寸，看不出来）
+        //   → 2160x1380（局部尺寸）→ 2560x1528（最大化客户区）。
+        // 中间那一跳是**系统最大化动画的中间帧**，来源正是 SetWindowPlacement 带
+        // SW_MAXIMIZE：目标状态是"普通窗口"，请求"最大化"，Windows 于是播一段从当前
+        // 尺寸撑到最大的过渡动画。用户看到的就是"先缩小（其实是动画起点与目标不
+        // 一致造成的缩放错觉）、再放大"。
+        //
+        // 改法：**不用 SetWindowPlacement 触发最大化，改为手动最大化**。
+        //   1) 补上 WS_MAXIMIZE 样式（IsZoomed 随之返回 true，tao 的 is_maximized 认得）；
+        //   2) SetWindowPos 一次性设到目标矩形——SetWindowPos 不走 WM_SYSCOMMAND，
+        //      不受"窗口最大化/最小化时动画"系统设置影响，没有中间帧；
+        //   3) 最后才写回真实还原矩形：此刻窗口**已经**是最大化状态，
+        //      SetWindowPlacement 请求的状态与当前一致，是幂等调用，不会再播动画。
+        //      （顺序不能反：先写还原矩形等于先把窗口缩回原尺寸，那才是真的"缩小"。）
+        //
+        // 目标矩形直接取当前（全屏时）的窗口矩形：实测它就是本显示器上最大化应有的
+        // 窗口矩形（2582x1550@(-11,-11)），四边含无边框窗口的阴影扩展，比 rcMonitor 准。
+        let target_left = before_rect.left;
+        let target_top = before_rect.top;
+        let target_width = before_rect.right - before_rect.left;
+        let target_height = before_rect.bottom - before_rect.top;
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style | (WS_MAXIMIZE as isize));
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            target_left,
+            target_top,
+            target_width,
+            target_height,
+            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        // 写回真实还原矩形。此刻窗口已是最大化状态，请求的状态与当前一致，是幂等
+        // 调用——不会再有"从普通尺寸撑到最大"的过渡。
+        placement.rcNormalPosition = original_rect;
+        placement.showCmd = SW_MAXIMIZE as u32;
+        if SetWindowPlacement(hwnd, &placement) == 0 {
+            return Err("应用窗口位置失败。".into());
+        }
+        // 再钉一次目标矩形。上面两条理论上都不播动画，但"理论上"不够——实测里
+        // 只要系统插入一帧中间尺寸，用户就会看到回弹。多这一次幂等的 SetWindowPos
+        // 保证最终位置立刻落定，代价只有一次 SWP。
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            target_left,
+            target_top,
+            target_width,
+            target_height,
+            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        crate::trace::log(format!(
+            "[窗口] finish 状态校验 showCmd={} 已最大化={}",
+            placement.showCmd,
+            IsZoomed(hwnd) != 0
+        ));
+        let mut after_rect = RECT::default();
+        GetWindowRect(hwnd, &mut after_rect);
+        crate::trace::log(format!(
+            "[窗口] finish 收尾 前={}x{}@({},{}) 后={}x{}@({},{}) 还原矩形={}x{}@({},{})",
+            before_rect.right - before_rect.left,
+            before_rect.bottom - before_rect.top,
+            before_rect.left,
+            before_rect.top,
+            after_rect.right - after_rect.left,
+            after_rect.bottom - after_rect.top,
+            after_rect.left,
+            after_rect.top,
+            original_rect.right - original_rect.left,
+            original_rect.bottom - original_rect.top,
+            original_rect.left,
+            original_rect.top
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn window_finish_fullscreen(_window: tauri::Window) -> Result<bool, String> {
+    Ok(false)
+}
+
+#[tauri::command]
+fn history_save(
+    app: tauri::AppHandle,
+    item: WatchHistoryItem,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.database.save_history(&item)?;
+    let canonical = state
+        .database
+        .get_history_item(&item.series_id, item.history_type.as_deref())
+        .ok()
+        .flatten()
+        .unwrap_or(item);
+    if let Ok(payload) = serde_json::to_value(canonical) {
+        native_player::emit_main(&app, "history-updated", payload);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn history_remove(
+    series_id: String,
+    history_type: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .database
+        .remove_history(&series_id, history_type.as_deref())
+}
+
+#[tauri::command]
+fn history_clear(scope: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+    state.database.clear_history(scope.as_deref())
+}
+
+/// 读收藏。与 `history_list` 同理：搬出主线程。
+#[tauri::command]
+async fn favorites_list(
+    mark: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<FavoriteItem>, String> {
+    let database = std::sync::Arc::clone(&state.database);
+    tauri::async_runtime::spawn_blocking(move || database.list_favorites(mark.as_deref()))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn favorites_save(item: FavoriteItem, state: State<'_, AppState>) -> Result<(), String> {
+    state.database.save_favorite(&item)
+}
+
+#[tauri::command]
+fn favorites_remove(series_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.database.remove_favorite(&series_id)
+}
+
+#[tauri::command]
+fn settings_get(state: State<'_, AppState>) -> Result<UserSettings, String> {
+    let mut settings = state.database.settings_get()?;
+    // 读取侧也做一次强制：磁盘上的列表可能是旧版本写的（19 个源里的任意组合、
+    // 甚至空列表）。"红果固定"必须对旧数据同样成立，不能只在新保存时生效。
+    settings.enabled_sources = normalize_enabled_sources(&settings.enabled_sources);
+    Ok(settings)
+}
+
+/// 清洗启用源列表：**内置源恒定在列**，其余只接受已安装的插件源。
+///
+/// ## 2026-11-02 的语义变化
+///
+/// 旧实现按 `GUO_SOURCES`（19 个站源）白名单过滤。源收敛后语义反过来了：
+/// 列表的**基准**是内置源（红果），用户输入只能往里加"已安装的插件源"，
+/// 不能删掉内置源——用户要求红果前后端都固定。
+///
+/// 已下架的 18 个站源**不认**：它们留在历史设置里是事实，但重新进列表就会重新
+/// 参与聚合，等于把下架撤销了。它们仍然能被 `source_name` / `source_is_adult`
+/// 解析（历史记录要显示来源名、18+ 门闩不能失效）。
+///
+/// 2026-11-02 二次收敛：自定义源不再进这个列表——它们的启停由
+/// `custom-sources.json` 里的 `enabled` 自己管，塞进 `enabled_sources` 会变成
+/// 两处状态各写一半（删源后还留着幽灵 id）。这里只剩一个恒定的内置源。
+fn normalize_enabled_sources(_input: &[String]) -> Vec<String> {
+    vec![crate::source_registry::PINNED_SOURCE_ID.to_string()]
+}
+
+/// 视频源清单：内置两源（固定、不可移除）+ 用户自己添加的自定义源。
+///
+/// 前端"视频源"设置卡只渲染这一份数据，不再自己维护静态源表——源表一旦分两处，
+/// 收敛与下架就会漏一边（历史上 `guoSources.ts` 与 `GUO_SOURCES` 就是这么漂的）。
+#[tauri::command]
+fn source_list() -> Result<serde_json::Value, String> {
+    let builtin: Vec<serde_json::Value> = crate::source_registry::BUILTIN_SOURCES
+        .iter()
+        .map(|source| {
+            serde_json::json!({
+                "id": source.id,
+                "name": source.name,
+                "kind": source.kind.as_str(),
+                "description": source.description,
+                "builtin": true,
+                "enabled": true,
+                "removable": false,
+            })
+        })
+        .collect();
+    let custom = crate::source_registry::load_custom_sources();
+    Ok(serde_json::json!({
+        "builtin": builtin,
+        "custom": custom,
+        "sourcesFile": crate::source_registry::custom_sources_path().to_string_lossy(),
+        // 格式规范文件在应用目录外（项目根的 `视频源格式.txt`），这里只给名字，
+        // 让设置页能提示"去哪看字段说明"，而不是把一大段说明塞进 IPC。
+        "formatDoc": "视频源格式.txt",
+    }))
+}
+
+/// 添加一条自定义源（苹果 CMS 接口定义）。校验失败会把原因原样回给前端。
+#[tauri::command]
+fn source_add(source: crate::source_registry::CustomSource) -> Result<serde_json::Value, String> {
+    let added = crate::source_registry::add_custom_source(source)?;
+    serde_json::to_value(added).map_err(|error| error.to_string())
+}
+
+/// 删除一条自定义源。返回 `true` 表示真的删掉了（不存在时返回 `false`）。
+#[tauri::command]
+fn source_remove(id: String) -> Result<bool, String> {
+    crate::source_registry::remove_custom_source(&id)
+}
+
+/// 启停一条自定义源。
+#[tauri::command]
+fn source_toggle(id: String, enabled: bool) -> Result<(), String> {
+    crate::source_registry::toggle_custom_source(&id, enabled)
+}
+
+/// 真实请求一次自定义源的列表接口（设置页「测试」按钮）。
+#[tauri::command]
+async fn source_probe(id: String) -> Result<crate::source_registry::ProbeResult, String> {
+    crate::source_registry::probe_custom_source(&id).await
+}
+
+/// 代理模式白名单归一。
+///
+/// 只认三个值：`auto` / `direct` / `proxy`。其余（含空串、旧版遗留值、
+/// 前端拼错）一律回落到 `auto` —— 那是"探测决定"的安全默认，绝不会让
+/// 一个脏值把用户锁死在"永不走代理"或"永远走一个坏代理"上。
+///
+/// 为什么不报错：设置页保存是一个高频、幂等的动作，因为一个脏字符串就
+/// 整体拒绝保存，会让其它真实设置（缓存上限、VSR）一起丢失。
+fn normalize_proxy_mode(value: &str) -> String {
+    match value.trim() {
+        "direct" => "direct".into(),
+        "proxy" => "proxy".into(),
+        _ => "auto".into(),
+    }
+}
+
+/// 总开关关闭时，把 18+ 源从启用列表里剔除。
+///
+/// 为什么必须在**写入**时剔除，而不只靠运行期守卫：`enabledSources` 是持久化
+/// 18+ 启用状态**刻意不在这里剔除**（曾经剔除过，语义不对，已撤回）。
+///
+/// 剔除看起来更"干净"：开关关着就不该留下"帝果已启用"这个自相矛盾的组合。
+/// 但设置页的设计决策是**关闭总开关时把 18+ 那组置灰、而不是静默取消已勾选项**
+/// ——用户回来重新开启时不该发现自己的选择被吃掉了。取消勾选是一次用户没要求的
+/// 数据丢失，置灰只是"现在不能用"。
+///
+/// 更关键的是：留一个源 id 在磁盘上**不构成内容泄露**。门闩拦的是内容本身
+/// （`gated_source` / `ensure_series_source_allowed` 按请求裁决），磁盘上存着
+/// "用户曾经授权过帝果"这个事实，既拿不到目录也开不了流。
+///
+/// 顺序上仍然要排在 `normalize_enabled_sources` 之前的是另一件事：去重与丢弃
+/// 未知 id（全空时回落到红果，否则会存下一个"零可用源"的设置）。
+#[tauri::command]
+fn settings_save(mut settings: UserSettings, state: State<'_, AppState>) -> Result<(), String> {
+    // 用户可控项：目标帧率做区间夹取。
+    settings.target_fps = settings.target_fps.clamp(30, 120);
+    // 能力受限项：如实归零而非静默接受。
+    // - 清晰度：公开网页与 App 源都只有单一路径，多档位是幻影，强制 auto。
+    // - 增强引擎：未接入真实补帧 SDK，只支持 off。
+    // - 目录缓存字节：**这个字段不再代表占用**。设置页显示的是
+    //   `short_drama_app_cache_usage` 现场扫描 short-series / motion-comic /
+    //   rtx-vsr 三个目录得到的真实字节数（见 short_drama_app.rs 的 `cache_usage`）。
+    //   字段保持 0 只是兼容旧设置库记录，写非 0 反而会让旧前端显示一个假数字。
+    // 这些是"诚实报告边界"，不是丢弃用户输入——相应开关在 UI 上也不提供。
+    settings.default_quality = "auto".into();
+    settings.preferred_engine = "off".into();
+    settings.catalog_cache_mb = 0.0;
+    // 剧集缓存上限是真实用户设置：清洗旧版 0 哨兵后立即写入清理器，保存即生效。
+    settings.playback_cache_mb =
+        if settings.playback_cache_mb.is_finite() && settings.playback_cache_mb > 0.0 {
+            settings.playback_cache_mb.clamp(256.0, 16_384.0)
+        } else {
+            1024.0
+        };
+    short_drama_app::set_cache_budget_mb(settings.playback_cache_mb);
+    // 启用源列表：去重 + 丢弃未知 id（源表在前端，后端不认也得挡住脏 id 进库），
+    // 全空时回落到红果，否则用户会存下一个"零可用源"的设置。
+    // ⚠️ 这里**不**剔除 18+ 源：设置页的设计决策是关闭总开关时置灰而非取消勾选，
+    // 内容侧的拦截由 `gated_source` / `ensure_series_source_allowed` 按请求负责。
+    settings.enabled_sources = normalize_enabled_sources(&settings.enabled_sources);
+    // VSR 播放链路开关：运行期即时生效——写库之前先灌进 AtomicBool，
+    // 无需重启进程，下一次 `playback_open` 就走新链路。
+    // 注意这里**不做任何强制改写**：它是真实可用的用户设置，不是不变量 8
+    // 里那批「能力受限、如实归零」的字段。
+    set_vsr_enabled(settings.vsr_enabled);
+    // 正式开放后允许用户选择 mpv，无需额外的二级灰度开关门槛。
+    settings.preferred_player = match settings.preferred_player.as_str() {
+        "mpv" if crate::native_player::NATIVE_PLAYER_AVAILABLE => "mpv".into(),
+        _ => "webview".into(),
+    };
+    settings.native_player_enabled = crate::native_player::NATIVE_PLAYER_AVAILABLE;
+    // 短剧推荐已正式全量开放，兼容保留契约字段并固定为 true。
+    settings.feed_enabled = true;
+    // 18+ 总开关一变，**必须作废 guo 侧已算出来的内容缓存**（封面路径 / 详情 /
+    // 档位）。原因见 `GuoProvider::clear_content_caches` 的注释：缓存里存的是
+    // "已放行时算出来的答案"，关掉开关后前端只要还握着旧路径就能继续渲染缩略图，
+    // 而 `guo_cover` 的门闩此时根本不会被调用到 —— 门闩等于漏了。
+    //
+    // 只在**真的变了**时才清：设置页会为其它无关字段反复保存（拖滑块、切主题），
+    // 每次都清会把封面缓存的收益抹平。读不到旧值就按"变了"处理（保守：清缓存只是
+    // 让下一次重算，不清则可能泄露已禁内容）。
+    let adult_toggled = state
+        .database
+        .settings_get()
+        .map(|previous| previous.show_adult_sources != settings.show_adult_sources)
+        .unwrap_or(true);
+    if adult_toggled {
+        state.guo_provider.clear_content_caches();
+    }
+    // 代理模式：运行期即时生效。用户切到「直连」时立刻把代理判死，不必重启 ——
+    // 这正是这个开关存在的意义：出现"目录加载失败"时，用户能自己一步绕过去。
+    settings.proxy_mode = normalize_proxy_mode(&settings.proxy_mode);
+    // 弹幕观感（2026-11-07）：与播放器「弹幕设置」面板的滑条档位一致地夹取，
+    // 防止手改过的设置记录把渲染层（行高/透明度）推到离谱值。UI 本身已限定
+    // 范围，这里是同一套边界的第二道闸。
+    sanitize_danmaku_settings(&mut settings);
+    crate::provider::apply_proxy_mode(&settings.proxy_mode);
+    let saved = state.database.settings_save(&settings);
+    if saved.is_ok() {
+        // 文件删除不能拖住设置保存的 IPC 返回，放到独立线程立即收敛。
+        std::thread::spawn(short_drama_app::enforce_cache_budget_now);
+        native_player::sync_settings(&settings);
+    }
+    saved
+}
+
+/// 统一夹取并归一弹幕观感设置（主设置保存与原生播放器回传共用同一套边界）。
+pub(crate) fn sanitize_danmaku_settings(settings: &mut UserSettings) {
+    if settings.danmaku_area.is_finite() {
+        settings.danmaku_area = settings.danmaku_area.clamp(25.0, 100.0);
+    } else {
+        settings.danmaku_area = 25.0;
+    }
+    if settings.danmaku_opacity.is_finite() {
+        settings.danmaku_opacity = settings.danmaku_opacity.clamp(10.0, 100.0);
+    } else {
+        settings.danmaku_opacity = 100.0;
+    }
+    if settings.danmaku_font_scale.is_finite() {
+        settings.danmaku_font_scale = settings.danmaku_font_scale.clamp(50.0, 200.0);
+    } else {
+        settings.danmaku_font_scale = 100.0;
+    }
+    settings.danmaku_speed = settings.danmaku_speed.clamp(0, 2);
+    settings.danmaku_color = normalize_danmaku_color(&settings.danmaku_color);
+    let trimmed_font = settings.danmaku_font.trim();
+    if trimmed_font.is_empty() {
+        settings.danmaku_font = "Microsoft YaHei".into();
+    } else if trimmed_font != settings.danmaku_font {
+        settings.danmaku_font = trimmed_font.to_string();
+    }
+    settings.danmaku_stroke = match settings.danmaku_stroke.as_str() {
+        "outline" | "shadow" => settings.danmaku_stroke.clone(),
+        _ => "heavy".into(),
+    };
+}
+
+/// 弹幕颜色归一：只认 `#RGB` / `#RRGGBB`，其余（含手改过的脏值）回落白色。
+/// 与前端 `normalizeHexColor` 同一套判据，大小写统一成大写。
+fn normalize_danmaku_color(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let bytes = trimmed.as_bytes();
+    let valid = (bytes.len() == 7 || bytes.len() == 4)
+        && bytes[0] == b'#'
+        && bytes[1..].iter().all(|c| c.is_ascii_hexdigit());
+    if valid {
+        trimmed.to_ascii_uppercase()
+    } else {
+        "#FFFFFF".into()
+    }
+}
+
+/// 代理连通性自检（设置页「测试」按钮）。
+///
+/// ## 为什么值得单独开一条命令
+///
+/// 这个项目在代理上栽过三次（`10061` 目录全灭、更新检查失败、guo 源 403），
+/// 每次的共同点是：**用户看到的只是一句"加载失败"，而真实原因在几十行之外**。
+/// 排查成本全花在"从症状倒推是不是代理"上。
+///
+/// 这条命令把那个推理过程一次做完并如实报告：系统代理配了什么、端口通不通、
+/// 直连能不能取到红果目录。用户点一下就能知道该不该动设置页的代理开关，
+/// 而不是等下次再遇到"目录加载失败"。
+#[tauri::command]
+async fn proxy_diagnose() -> Result<serde_json::Value, String> {
+    let address = crate::update::system_proxy_address();
+    // 探一次端口：与启动自检用的是同一个函数，结论不会互相矛盾。
+    let reachable = address
+        .as_deref()
+        .map(crate::provider::tcp_reachable_public)
+        .unwrap_or(false);
+    // 直连取一次目录：这是"绕开代理到底行不行"的最终判据。
+    // 用 `/category`（最小的一页）而不是整站首页，避免把 300KB 拖进这次诊断。
+    let direct_ok = crate::provider::probe_direct_catalog().await;
+    Ok(serde_json::json!({
+        "proxyAddress": address,
+        "proxyReachable": reachable,
+        "directCatalogOk": direct_ok,
+        "proxyDead": crate::provider::is_proxy_dead(),
+    }))
+}
+
+/// 清空缓存（设置页按钮）。
+///
+/// 这里曾经只清 AppState::cache_dir（即 <.app-data>/cache）——那是本应用自己的
+/// 目录，而**剧集视频实际由 worker 写在 <data_dir>/short-drama-cache**，
+/// 两者不是同一个位置。结果是「一键释放缓存」永远报 0 MB，而真正占地的 2GB+
+/// 视频文件从未被触及。现在改为委托给 short_drama_app_cache_clear，
+/// 由它清理真实的剧集缓存并返回释放量。
+#[tauri::command]
+async fn cache_clear(state: State<'_, AppState>) -> Result<CacheClearResult, String> {
+    let cache_dir = state.cache_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        media_enhance::cleanup_all(false);
+        crate::dmghg_bridge::clear_catalog_cache();
+        crate::media_enhance::clear_encoder_capability_cache();
+        let own = clear_directory(&cache_dir).unwrap_or(0);
+        let report = short_drama_app_cache_clear()?;
+        Ok(CacheClearResult {
+            freed_mb: (own + report.freed_bytes) as f64 / 1024.0 / 1024.0,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn clear_directory(path: &Path) -> Result<u64, String> {
+    if !path.exists() {
+        fs::create_dir_all(path).map_err(|error| error.to_string())?;
+        return Ok(0);
+    }
+    let mut total = 0;
+    for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let entry_path = entry.path();
+        let metadata = entry.metadata().map_err(|error| error.to_string())?;
+        if metadata.is_dir() {
+            total += clear_directory(&entry_path)?;
+            fs::remove_dir(&entry_path).map_err(|error| error.to_string())?;
+        } else {
+            total += metadata.len();
+            fs::remove_file(&entry_path).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(total)
+}
+
+/// 应用数据根目录（SQLite / 剧集缓存 / WebView2 user-data 共用）。
+///
+/// 默认 Tauri 的 `app_data_dir()` 在 Windows 上是
+/// `C:\Users\<user>\AppData\Roaming\<identifier>`。但当系统盘写满时，
+/// 在那里创建 SQLite 库会直接以 `disk I/O error` 让 setup 钩子 panic，
+/// 应用连窗口都起不来；WebView2 也会因为写不进 GPU/着色器缓存而整片黑屏。
+///
+/// 因此这里改用"可执行文件所在盘"作为根目录：exe 位于
+/// `<crate>/target/debug/ttv-short-drama.exe`，回退两级即 crate 根目录，
+/// 最终数据落在 `<crate>/.app-data/`（开发态通常空间充足）。
+/// 只有该位置不可写时才退回系统默认目录。
+pub(crate) fn app_storage_root() -> Option<PathBuf> {
+    if cfg!(test) {
+        return Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/playback-test-data"));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    // 只有 **cargo 构建产物**（<crate>/src-tauri/target/{debug,release}/）才把数据
+    // 放在项目内，方便开发期查看与清理。
+    //
+    // 旧实现无条件向上回退两级，注释假设 exe 位于 "<crate>/target/debug"，
+    // 但真实布局是 "<crate>/src-tauri/target/debug"，于是回退两级得到的是
+    // **src-tauri/target** 的父目录；而打包安装后 exe 位于安装目录，回退两级
+    // 会落到 %LOCALAPPDATA% 或 Program Files 的上一级，在那里凭空创建
+    // ".app-data"（实测落在 %APPDATA%\..\.app-data），SQLite、剧集缓存与
+    // WebView2 用户数据全部被塞进这个非标准位置。
+    // 现在：非 cargo 构建一律返回 None，由调用方回退到 Tauri 的 app_data_dir()。
+    let is_cargo_target = exe_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "debug" || name == "release")
+        && exe_dir
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "target");
+    if is_cargo_target {
+        if let Some(crate_dir) = exe_dir.parent().and_then(Path::parent) {
+            let candidate = crate_dir.join(".app-data");
+            if std::fs::create_dir_all(&candidate).is_ok() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// 配置 WebView2 启动参数。
+///
+/// 三件事：
+/// 1. 确保开启 `PlatformHEVCDecoderSupport` —— 没有它，HEVC 源流无法播放。
+/// 2. 剔除 `--disable-gpu-compositing` —— 那是当年 C 盘写满导致黑屏时的兜底，
+///    如今 user-data 已迁到可写盘、根因消除；而它会把渲染与解码压回软件路径，
+///    既让 30 处 backdrop-blur 异常昂贵，也会让平台 HEVC 硬解走不通。
+/// 3. 关闭后台节流（2026-10-21）—— 见下面 `ANTI_THROTTLE_ARGS` 的说明。
+///
+/// 保留用户/脚本传入的其他参数，只做追加与剔除，不整体覆盖。
+fn configure_webview_browser_arguments() {
+    const HEVC_FEATURE: &str = "PlatformHEVCDecoderSupport";
+    /**
+     * 禁止 WebView2 在窗口失焦/被遮挡/最小化时冻结或降频渲染进程。
+     *
+     * ## 为什么必须显式写在这里，而不是只写进 `tauri.conf.json`
+     *
+     * `tauri.conf.json` 的 `additionalBrowserArgs` 由 Tauri **在 Builder 启动时**
+     * 写进 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`，而本函数在那之前就执行了
+     * （见调用点：它排在 `tauri::Builder::default()` 前面）。所以从这里读到的
+     * 环境变量是空串，`set_var` 反而会把 conf 里的配置**整个盖掉**。
+     *
+     * 实测（ttv-playback.log，2026-10-21）：
+     *   日志打出「WebView2 启动参数：--enable-features=PlatformHEVCDecoderSupport」
+     *   —— conf 里那三条 anti-throttle 参数一条都没进去。
+     * 于是播放时"收起窗口"会触发 Chromium 的后台节流：JS 定时器被降到 1 秒/次
+     * 甚至整个渲染进程被冻结，表现为**画面停住、日志空白 12~32 秒**，
+     * 恢复后播放位置一次性追上。用户侧的感受就是"卡了一下，缓冲一下"。
+     *
+     * ## 为什么这三条是必需的（缺一不可）
+     *
+     *   - `--disable-background-timer-throttling`
+     *     不让后台页面的 setTimeout/setInterval 降频。播放器的进度心跳、
+     *     末尾复核、看门狗全靠定时器 —— 被降频就等于全部失灵。
+     *   - `--disable-backgrounding-occluded-windows`
+     *     窗口被其它窗口遮住时不降级。用户"收起播放器去看别的"正是这个场景。
+     *   - `--disable-renderer-backgrounding`
+     *     不让渲染进程进入后台优先级，避免整个 JS 线程被挂起。
+     */
+    const ANTI_THROTTLE_ARGS: [&str; 3] = [
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+    ];
+    let existing = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+
+    // 保留有效参数，丢弃已过时的软件光栅开关。
+    let mut kept: Vec<String> = existing
+        .split_whitespace()
+        .filter(|arg| *arg != "--disable-gpu-compositing")
+        .map(str::to_string)
+        .collect();
+
+    // 合并 --enable-features：保留他人已启用的特性，追加 HEVC 支持。
+    let feature_index = kept
+        .iter()
+        .position(|arg| arg.starts_with("--enable-features="));
+    match feature_index {
+        Some(index) => {
+            let current = kept[index].clone();
+            if !current.contains(HEVC_FEATURE) {
+                kept[index] = format!("{current},{HEVC_FEATURE}");
+            }
+        }
+        None => kept.push(format!("--enable-features={HEVC_FEATURE}")),
+    }
+
+    // 补齐反节流参数（幂等：已存在的不重复追加）。
+    for arg in ANTI_THROTTLE_ARGS {
+        if !kept.iter().any(|existing| existing == arg) {
+            kept.push(arg.to_string());
+        }
+    }
+
+    let merged = kept.join(" ");
+    eprintln!("[ttv] WebView2 启动参数：{merged}");
+    std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", merged);
+}
+
+/// 为当前进程申请"高性能 GPU"（Windows 图形首选项）。
+///
+/// ## 为什么需要它
+///
+/// 本机是 **AMD Radeon 610M（核显）+ NVIDIA GeForce RTX 5060 Laptop** 的双显卡
+/// 笔记本，Windows 默认按省电策略把非游戏进程交给核显。而 **RTX 视频增强（VSR）
+/// 是 NVIDIA 驱动侧的功能**：进程跑在核显上时它根本不会被挂载，用户看到的就是
+/// "同一个驱动设置，这个播放器不生效、别的播放器生效"。
+///
+/// 这条链路在 0.2.5 随补帧一起被删掉过，后果很隐蔽：开发态（exe 在
+/// `target/debug`）因为注册表里**留有旧条目**照常走独显，而打包安装后的 exe
+/// （`%LOCALAPPDATA%\TTV Short Drama`）**没有任何首选项**——于是"开发时能用、
+/// 装完就没了"。实测本机注册表里只有 debug 那一条：
+///
+/// ```text
+/// D:\...\src-tauri\target\debug\ttv-short-drama.exe = GpuPreference=2;
+/// ```
+///
+/// ## 边界
+///
+/// - 只写 `HKCU`（当前用户），不需要管理员权限；幂等，值相同则不重复写。
+/// - 失败一律静默：首选项缺失只影响画质增强，不该让应用起不来。
+/// - 首选项在**进程启动时**读取，写入后需要重启应用才生效；这里只在真正需要
+///   改动的首次运行写一次，并在日志里说明。
+#[cfg(windows)]
+fn apply_windows_gpu_preference() {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
+    };
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(exe_text) = exe.to_str() else {
+        return;
+    };
+    // 值与值名都必须是 NUL 结尾的 UTF-16。
+    let exe_name: Vec<u16> = exe_text.encode_utf16().chain(std::iter::once(0)).collect();
+    let sub_key: Vec<u16> = "Software\\Microsoft\\DirectX\\UserGpuPreferences"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // GpuPreference=2 = "高性能"（独显）。
+    let value: Vec<u16> = "GpuPreference=2;"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let mut key: windows_sys::Win32::System::Registry::HKEY = std::ptr::null_mut();
+        let status = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            sub_key.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        );
+        if status != 0 {
+            eprintln!("[ttv] 图形首选项：打开注册表键失败（{status}），跳过");
+            return;
+        }
+        let bytes = std::slice::from_raw_parts(value.as_ptr() as *const u8, value.len() * 2);
+        let status = RegSetValueExW(
+            key,
+            exe_name.as_ptr(),
+            0,
+            REG_SZ,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        );
+        let _ = RegCloseKey(key);
+        if status == 0 {
+            eprintln!("[ttv] 图形首选项：已为当前 exe 申请高性能 GPU（RTX 视频增强依赖独显，下次启动生效）");
+        } else {
+            eprintln!("[ttv] 图形首选项：写入失败（{status}），跳过");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_windows_gpu_preference() {}
+
+fn main() {
+    // ⚠️ 必须是**第一行**：把日志的相对时间零点钉在进程启动。
+    //
+    // 放在这里之前曾经出过一个大坑：旧实现的计时起点是"第一次写日志那一刻"，
+    // 而第一次写日志发生在 setup() 里两个 DLL 加载之后。于是日志永远显示
+    // `+0.000s` 起步，用户报的"点图标卡一会儿"在日志里**根本看不到** ——
+    // 那段耗时全落在零点之前。详见 `trace::mark_process_start` 的注释。
+    crate::trace::mark_process_start();
+    // 历史背景：系统盘写满时，WebView2 写不了 GPU/着色器缓存 → 合成管线初始化失败
+    // → 窗口内容区整片纯黑。当时用 `--disable-gpu-compositing` 兜底，但那会让全部
+    // 渲染退回 CPU 软件光栅；而界面大量使用 `backdrop-blur`（30 处），软件高斯模糊
+    // 极其昂贵——实测首页静止时 WebView2 仍持续占用约 50% 单核，表现为明显卡顿。
+    //
+    // 黑屏的真正根因是"缓存写不进去"，而 WebView2 的 user-data（含 GPU/着色器缓存）
+    // 现已迁到空间充足的盘（见下方 WEBVIEW2_USER_DATA_FOLDER），根因已消除，
+    // 因此不再禁用 GPU 合成，让 blur 走硬件加速。
+    if let Some(data_dir) = app_storage_root().map(|root| root.join("webview-data")) {
+        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &data_dir);
+    }
+    // 允许 WebView2 使用系统平台解码器解 HEVC。
+    //
+    // 播放失败的根因：App-API 返回的源流是 HEVC(H.265)/hvc1（实测短剧 1080x1920、
+    // 漫剧 1920x1080，缓存里每一集都是），而 Chromium 内核默认关闭 HEVC 解码，
+    // HTML5 <video> 直接报错 —— 界面上表现为"该媒体无法由 WebView 解码"。
+    // 本机已安装 Microsoft.HEVCVideoExtension，打开这个特性开关即可复用系统解码器，
+    // 无需把每集转码成 H.264（转码会耗时 20s+/集、体积膨胀约 2.5 倍）。
+    configure_webview_browser_arguments();
+    // 让本进程走独显：RTX 视频增强（VSR）只在 NVIDIA 显卡渲染的视频上生效。
+    apply_windows_gpu_preference();
+
+    tauri::Builder::default()
+        .setup(|app| {
+            // ===== 启动阶段打点 =====
+            //
+            // 用户报「点图标后要卡一会儿才开始加载」。窗口出现之前的耗时全在这
+            // 个 setup 里，而它是**同步**的 —— 每一项都在推迟第一帧。
+            // 之前没有任何分段计时，只能靠猜；这里把每个阻塞点单独记一行，
+            // 下次再有人报"启动慢"，日志里直接能看到是谁。
+            let setup_started = std::time::Instant::now();
+            let mut last_mark = setup_started;
+            // 记一段并推进基准。`label` 写英文短名，便于 grep。
+            let mut mark = |label: &str| {
+                let now = std::time::Instant::now();
+                crate::trace::log(format!(
+                    "[boot] {label} +{}ms（累计 {}ms）",
+                    now.duration_since(last_mark).as_millis(),
+                    now.duration_since(setup_started).as_millis()
+                ));
+                last_mark = now;
+            };
+            // AppState 的 SQLite 与剧集缓存也落在同一个可写根目录下。
+            let app_dir = app_storage_root().unwrap_or_else(|| {
+                app.path()
+                    .app_data_dir()
+                    .unwrap_or_else(|_| std::env::temp_dir().join("ttv-short-drama"))
+            });
+            fs::create_dir_all(&app_dir).map_err(|error| error.to_string())?;
+            let cache_dir = app_dir.join("cache");
+            fs::create_dir_all(&cache_dir).map_err(|error| error.to_string())?;
+            mark("创建目录");
+            let provider = DramaProvider::new()?;
+            mark("DramaProvider::new（HTTP 客户端 + 代理探测）");
+            // ⚠️ 这一行会**同步加载外部 DLL**（动漫共和国桥接），是启动期
+            // 最重的单个阻塞点之一。详见 `AnimeProvider::new` 的注释。
+            let anime_provider = crate::anime_provider::AnimeProvider::new()?;
+            mark("AnimeProvider::new（dmghg DLL 加载）");
+            let resource_dir = app
+                .path()
+                .resource_dir()
+                .unwrap_or_else(|_| app_dir.join("resources"));
+            // ⚠️ 同样跨 FFI：`GuoBridge::load` + 一次 `initialize` 调用。
+            let guo_provider = Arc::new(crate::guo_provider::GuoProvider::new(
+                &resource_dir,
+                &app_dir,
+            )?);
+            mark("GuoProvider::new（guo-core DLL 加载 + initialize）");
+            // guo 源的封面由 guo-core 下载到 `<app_dir>/guo-core/covers-v1` 后经
+            // asset 协议呈现：dev 态这个目录在项目内（.app-data），不在默认的
+            // `$APPLOCALDATA` scope 里，不显式放行生产/dev 两端都会 403。
+            let _ = app
+                .asset_protocol_scope()
+                .allow_directory(app_dir.join("guo-core"), true);
+            let database = Database::open(&app_dir.join("short-drama.sqlite3"))?;
+            mark("Database::open（SQLite 建表/迁移）");
+            let initial_settings = database.settings_get().unwrap_or_default();
+            short_drama_app::set_cache_budget_mb(initial_settings.playback_cache_mb);
+            set_vsr_enabled(initial_settings.vsr_enabled);
+            let saved_proxy_mode = normalize_proxy_mode(&initial_settings.proxy_mode);
+            provider.probe_proxy_on_startup(&saved_proxy_mode);
+            app.manage(AppState {
+                provider,
+                anime_provider,
+                guo_provider,
+                huangguo_provider: crate::huangguo_provider::HuangguoProvider::new()?,
+                database: std::sync::Arc::new(database),
+                sessions: Mutex::new(HashMap::new()),
+                cache_dir,
+            });
+
+            // 画中画小窗的交接状态：窗口按需创建，状态随进程存活。
+            app.manage(crate::pip::PipState::default());
+            app.manage(crate::agent_dock::DockStateStore::default());
+
+            // 智能体联动桥：127.0.0.1 回环上的极简 HTTP 接收端（hook POST 进来、
+            // 转成 agent://event 广播给主窗口）。无论功能开关与否都启动——
+            // 监听本身零成本（一个空闲的 TcpListener），开关只由前端决定"要不要
+            // 响应事件"；这样用户在设置页拨开开关时立即生效，不用重启应用。
+            // 端口全被占时桥不存在，设置页会如实显示并禁用配置复制。
+            crate::agent_bridge::start(app.handle().clone());
+
+            // 主窗口关闭 = 退出应用：小窗是同进程里的另一个窗口，不跟着收掉就会
+            // 留下一个没有落点的悬浮窗（Tauri 要等最后一个窗口关闭才退出进程）。
+            if let Some(main_window) = app.get_webview_window("main") {
+                let handle = app.handle().clone();
+                main_window.on_window_event(move |event| {
+                    if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                        crate::pip::dismiss_on_main_close(&handle);
+                        // 悬浮窗同样是同进程里的另一个窗口，主窗口关掉必须一起收掉，
+                        // 否则进程会留着一个没有落点的置顶窗不退出。
+                        crate::agent_dock::destroy(&handle);
+                        frame_interp_stop();
+                        crate::native_player::stop();
+                    }
+                    // 主窗口重新拿到焦点 = 用户把主界面叫回来了。
+                    //
+                    // 这时小窗必须立刻让位，否则就是用户报的那个严重故障：
+                    // 主界面与小窗同时在播、两块画面各出一路声音。
+                    // 「任何时刻只看见一个窗口」不能只靠进入小窗时 hide 一次 ——
+                    // 用户完全可以用任务栏 / Alt+Tab 把主窗口叫出来。
+                    //
+                    // ⚠️ 必须附加"主窗口此刻可见"这个条件：进入小窗的那一瞬，
+                    // 小窗的 `setFocus()` 会把焦点抢过去（Focused(false)），
+                    // 而主窗口要等到前端收到 `pip://shown` 才 hide。这段窗口期里
+                    // 若主窗口因为任何原因再拿到一次焦点，不加判据就会把小窗刚开就关掉。
+                    if let tauri::WindowEvent::Focused(true) = event {
+                        if let Some(main) = handle.get_webview_window("main") {
+                            if main.is_visible().unwrap_or(false) {
+                                let _ = crate::pip::pip_dismiss(handle.clone());
+                            }
+                        }
+                    }
+                    // 全屏进出会在几百毫秒内连发多次 Resized，「退出全屏回弹」的
+                    // 真相就藏在这条时间线里：只看首尾矩形分不清中间弹了几次。
+                    // 节流在 trace 侧（尺寸未变丢弃 + 每 500ms 最多 12 条）。
+                    if let tauri::WindowEvent::Resized(size) = event {
+                        crate::trace::log_window_size(size.width, size.height);
+                    }
+                });
+            }
+
+            // 动漫专区 HLS 本地代理：**必须在 setup 内同步完成**。
+            //
+            // 旧实现用 spawn 异步启动。目录请求可能比它先到，`proxied_image_url`
+            // 此时返回 None，封面退回境外原地址；而播放地址也会带着未改写的远端
+            // m3u8 进入 hls.js，最终表现为封面全空、视频一直缓冲。
+            //
+            // 绑定 loopback 端口本身是毫秒级操作，同步做不会明显拖慢启动，
+            // 却能保证"第一次请求到达时，代理一定已经可用"。
+            match tauri::async_runtime::block_on(crate::hls_proxy::start()) {
+                Ok(port) => crate::trace::log(format!("[hls] 本地代理已启动 127.0.0.1:{port}")),
+                Err(error) => crate::trace::log(format!("[hls] 本地代理启动失败：{error}")),
+            }
+
+            // ===== 预热解析 worker 的 Python 环境（2026-10-22，首帧提速）=====
+            //
+            // ## 为什么值得做
+            //
+            // 红果整集播放的第一道门是「拿播放直链」，它由随包 Python worker 完成
+            // （`run_worker_subcommand` 每次 **spawn 一个新的 python.exe**）。冷启动
+            // 要付：解释器初始化 + `requests`/签名库等一大批 import + 读盘。
+            // 日志实测这条链路固定 **2.2 秒**，而它完全在用户点播放**之后**才开始跑
+            // —— 用户感知就是"点开先黑等两秒"。
+            //
+            // ## 为什么用 `selftest`
+            //
+            // 它只做纯逻辑断言（URL 拼装 / 错误码判定 / 画质回退），**不联网、
+            // 不读设备凭据、不写任何文件**，却会 import 全部依赖模块 —— 正好把
+            // 解释器与这些模块预热进系统文件缓存。
+            //
+            // ## 为什么放在后台
+            //
+            // 预热不该推迟第一帧：丢到后台，失败也静默（预热失败只意味着这次没省下
+            // 时间，绝不该影响播放）。
+            tauri::async_runtime::spawn(async {
+                let Ok((python, worker, _ffmpeg)) = crate::short_drama_app::worker_paths() else {
+                    return;
+                };
+                let mut command = tokio::process::Command::new(&python);
+                command
+                    .arg(&worker)
+                    .arg("selftest")
+                    .env("PYTHONNOUSERSITE", "1")
+                    .env("PYTHONIOENCODING", "utf-8")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .kill_on_drop(true);
+                #[cfg(windows)]
+                command.creation_flags(0x0800_0000); // 别弹控制台黑窗
+                match command.status().await {
+                    Ok(status) if status.success() => {
+                        crate::trace::log("[worker] Python 环境预热完成（首次解析不再付冷启动）")
+                    }
+                    Ok(status) => crate::trace::log(format!(
+                        "[worker] 预热退出码 {:?}（不影响播放，只是没省下冷启动）",
+                        status.code()
+                    )),
+                    Err(error) => crate::trace::log(format!("[worker] 预热失败（忽略）：{error}")),
+                }
+            });
+
+            tauri::async_runtime::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                crate::dmghg_bridge::prewarm_default_catalog().await;
+            });
+
+            // 让界面有日志可看之前，先把日志通道本身立起来。
+            //
+            // 顺序很关键：capture_stderr 必须在其它子进程（ffmpeg、worker）被拉起
+            // 之前调用，否则它们继承的是那个不存在的 STD_ERROR_HANDLE，错误输出
+            // 就永远丢掉了。
+            crate::trace::capture_stderr();
+            crate::trace::log_environment();
+
+            // 启动即自动整理缓存，无需用户确认。
+            //
+            // 处理三件事：清掉 worker 中断留下的半成品、删除超过保留期（7 天）
+            // 的陈旧剧集、并把总占用压回用户设置的缓存上限内。放在独立线程里执行，
+            // 避免在缓存很大时拖慢窗口创建（首次启动可能要删掉上 GB 文件）。
+            std::thread::spawn(|| {
+                // `true` = 保留 `vid-{vid}` 持久整集缓存：它们是"看过的集再打开零等待"
+                // 的依据，只有用户主动点「清空缓存」时才该消失（审查 R2）。
+                media_enhance::cleanup_all(true);
+                let report = short_drama_app::auto_clean_cache_on_start();
+                if report.removed_files > 0 {
+                    eprintln!(
+                        "[ttv] 缓存自动清理：删除 {} 个剧集，释放 {:.1} MB",
+                        report.removed_files,
+                        report.freed_bytes as f64 / 1024.0 / 1024.0
+                    );
+                }
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            catalog_list,
+            catalog_fast_search,
+            catalog_suggest,
+            // 系列剧「全部季」：网页链路只出当前在推的那一季，这里补全。
+            catalog_series_seasons,
+            catalog_categories,
+            // 搜索页热搜：只有 App 接口有，网页源没有。
+            hongguo_hot_search,
+            // ── 红果原生客户端的新增出口（hongguo_api.rs）────────────────────
+            // 搜索增强
+            hongguo_suggest,
+            hongguo_search_cues,
+            hongguo_search,
+            // 发现
+            hongguo_discover,
+            // 榜单与筛选
+            hongguo_short_rank,
+            hongguo_short_filter_panel,
+            hongguo_short_filter,
+            hongguo_ranking,
+            // 详情与推荐
+            hongguo_series_detail,
+            hongguo_series_batch,
+            hongguo_album,
+            hongguo_series_recommend,
+            // 演员
+            hongguo_person,
+            hongguo_person_works,
+            // 上新日历
+            hongguo_new_releases,
+            guo_cover,
+            guo_cover_batch,
+            guo_source_status,
+            guo_source_check,
+            guo_proxy_get,
+            guo_proxy_set,
+            anime_qualities,
+            // 黄果短剧专区（隐藏频道）
+            huangguo_cover,
+            huangguo_cover_batch,
+            series_detail,
+            playback_open,
+            playback_command,
+            playback_snapshot,
+            frame_interp_set,
+            native_player_open,
+            native_player_send,
+            native_player_queue,
+            native_player_queue_push,
+            native_player_status,
+            native_player_theme,
+            native_player_close,
+            short_drama_app_status,
+            short_drama_app_set_device,
+            short_drama_app_resolve,
+            short_drama_app_cancel_request,
+            // 前缀先行开播：与整集同参数的另一条快链路，前端先拿它出画。
+            short_drama_app_resolve_prefix,
+            // 边转边播：红果加密源直接转本地 H.264 HLS，首片约 1.1 秒落地。
+            // 与整集 resolve 并发跑，前者负责尽早出画、后者负责最终质量。
+            short_drama_app_open_stream,
+            // 预转下一集：连播期间把下一集提前转好，切换时零等待。
+            short_drama_app_prewarm_stream,
+            short_drama_app_cache_clear,
+            short_drama_app_cache_usage,
+            short_drama_app_stream,
+            short_drama_app_qualities,
+            // 弹幕：按 30 秒时间窗拉取红果弹幕，走同一台匿名设备的签名。
+            crate::hongguo_bridge::short_drama_app_danmaku,
+            short_drama_app_album,
+            short_drama_app_prefetch_stream,
+            short_drama_app_episode_counts,
+            short_drama_app_shelf_feed,
+            short_drama_app_cover_proxy,
+            history_list,
+            history_save,
+            history_remove,
+            history_clear,
+            favorites_list,
+            favorites_save,
+            favorites_remove,
+            window_prepare_fullscreen,
+            window_finish_fullscreen,
+            settings_get,
+            settings_save,
+            // 视频源：内置两源固定 + 用户自定义源（苹果 CMS 接口）。
+            source_list,
+            source_add,
+            source_remove,
+            source_toggle,
+            source_probe,
+            proxy_diagnose,
+            cache_clear,
+            pip_open,
+            pip_handoff,
+            pip_report,
+            pip_close,
+            pip_dismiss,
+            pip_is_open,
+            agent_bridge_status,
+            agent_test_call,
+            agent_targets,
+            agent_attach_all,
+            agent_detach_all,
+            agent_dock_show,
+            agent_dock_hide,
+            agent_dock_ready,
+            agent_dock_state,
+            agent_dock_action,
+            agent_dock_drag,
+            update_check,
+            update_probe_network,
+            update_download,
+            update_cancel_download,
+            update_reveal,
+            update_install,
+            app_version,
+            trace_ui_log,
+            trace_tail,
+            trace_clear,
+        ])
+        .run(tauri::generate_context!())
+        .expect("failed to run TTV Short Drama");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一个空页：命中/过期判定只看存进去的是什么值，不看内容是否合理。
+    fn fake_page(source: &str) -> CatalogPage {
+        CatalogPage {
+            items: Vec::new(),
+            total: 0,
+            has_more: false,
+            page: 1,
+            categories: Vec::new(),
+            next_cursor: None,
+            source: source.to_owned(),
+            degraded: false,
+        }
+    }
+
+    fn fake_filter() -> CatalogFilter {
+        CatalogFilter {
+            channel: "drama".into(),
+            source: None,
+            category: "全部".into(),
+            audience: "全部".into(),
+            sort: "hot".into(),
+            keyword: Some("战神".into()),
+            page: 1,
+            page_size: 24,
+            cursor: None,
+        }
+    }
+
+    /// 造一条"其它来源"的条目，只关心 id 与位次。
+    fn other_item(id: &str) -> SeriesItem {
+        SeriesItem {
+            id: id.into(),
+            title: format!("其它-{id}"),
+            cover: String::new(),
+            item_type: "drama".into(),
+            episodes_count: 1,
+            latest_episode_title: None,
+            tags: Vec::new(),
+            origin: "其它来源".into(),
+            brief: None,
+            rating: None,
+        }
+    }
+
+    /// 造一条 App 搜索命中的原始卡片。
+    fn app_hit(id: &str, episodes: u32) -> SeriesHit {
+        SeriesHit {
+            id: id.into(),
+            title: format!("直连-{id}"),
+            cover: format!("https://x/{id}.jpg"),
+            intro: "简介".into(),
+            episode_count: episodes,
+            content_type: None,
+        }
+    }
+
+    /// 造一条 App 联想的条目（走 Python worker 的那一路）。
+    fn suggestion_item(id: &str) -> crate::short_drama_app::SearchSuggestion {
+        crate::short_drama_app::SearchSuggestion {
+            id: id.into(),
+            title: format!("联想-{id}"),
+            cover: String::new(),
+            episode_count: 3,
+            tags: Vec::new(),
+        }
+    }
+
+    /// 四路合并：App 搜索排第一、按 id 去重（先到者胜）、`episode_cnt` 为 0 的
+    /// 卡被丢、联想留最后。
+    #[test]
+    fn app_search_merges_first_dedupes_and_drops_empty() {
+        let merged = merge_search_results(
+            Ok(vec![
+                app_hit("2", 115),
+                // 未上架 / 「盘点合集」类非剧集卡：点开必然空白，必须丢。
+                app_hit("9", 0),
+                // 与网页结果同 id：去重后只留 App 搜索这一条（位次在前）。
+                app_hit("3", 20),
+            ]),
+            vec![other_item("3"), other_item("7")],
+            Some(vec![other_item("7"), other_item("8")]),
+            vec![suggestion_item("8"), suggestion_item("10")],
+            "drama",
+        );
+
+        let ids: Vec<&str> = merged.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["2", "3", "7", "8", "10"],
+            "位次应为 App 搜索 → 网页 → 动漫 → 联想，且按 id 去重：{ids:?}"
+        );
+        // 未上架那条（episode_count = 0）不能出现。
+        assert!(!ids.contains(&"9"), "episode_cnt 为 0 的卡必须被丢弃");
+        // 映射字段：origin 要能和「红果 App 联想」区分，集数照搬。
+        assert_eq!(merged.items[0].origin, "红果 App 直连");
+        assert_eq!(merged.items[0].episodes_count, 115);
+        assert_eq!(merged.items[0].cover, "https://x/2.jpg");
+        // App 搜索不给题材，绝不能编。
+        assert!(merged.items[0].tags.is_empty());
+        assert!(!merged.app_failed);
+        assert!(!merged.anime_failed);
+    }
+
+    /// `degraded` 只认 App 搜索失败。
+    ///
+    /// 站点改 CSR 之后网页那一路恒空，如果"网页空"也算降级，每次搜索都会亮降级
+    /// 条，用户会很快学会无视它——那这个字段就等于没有。
+    #[test]
+    fn degraded_tracks_app_search_and_anime_failure() {
+        // 常态：网页空、动漫和联想都正常 → 不降级。
+        let normal = merge_search_results(
+            Ok(vec![app_hit("1", 10)]),
+            Vec::new(),
+            Some(Vec::new()),
+            Vec::new(),
+            "drama",
+        );
+        assert!(!normal.app_failed);
+        assert!(!normal.anime_failed);
+
+        // 动漫挂掉：它的条目整块缺席，结果同样不全 → 算降级。
+        //
+        // 这不与"网页恒空不算降级"矛盾：网页那路是**已知的常态失效**（站点改 CSR），
+        // 每次都空，报它等于每次都亮灯；而动漫源是**偶发故障**，挂了就是这一次真的少了东西。
+        let anime_down =
+            merge_search_results(Ok(Vec::new()), Vec::new(), None, Vec::new(), "drama");
+        assert!(!anime_down.app_failed, "动漫失败不该归因到 App 搜索");
+        assert!(anime_down.anime_failed, "动漫失败必须被记录下来");
+
+        // App 搜索挂掉：这才是降级。
+        let app_down = merge_search_results(
+            Err("network down".into()),
+            Vec::new(),
+            None,
+            Vec::new(),
+            "drama",
+        );
+        assert!(app_down.app_failed, "App 搜索失败必须置 degraded");
+        assert!(app_down.items.is_empty());
+    }
+
+    /// App 搜索只服务真人短剧档：漫剧/动漫/AI 剧频道不能接（否则串频道）。
+    #[test]
+    fn app_search_skips_comic_and_anime_channels() {
+        assert!(app_search_applies("drama"));
+        assert!(app_search_applies("short"));
+        assert!(!app_search_applies("comic"));
+        assert!(!app_search_applies("anime"));
+        assert!(!app_search_applies("ai"));
+    }
+
+    #[test]
+    fn search_cache_hit_returns_stored_value() {
+        let cache: SearchCache<CatalogPage> = SearchCache::new(Duration::from_secs(300));
+        cache.put("k".into(), fake_page("第一次"));
+        assert_eq!(
+            cache.get("k").map(|page| page.source).as_deref(),
+            Some("第一次")
+        );
+        // 同 key 再写再读，读到的是后写入的那份，说明第二次没有重跑上游。
+        cache.put("k".into(), fake_page("第二次"));
+        assert_eq!(
+            cache.get("k").map(|page| page.source).as_deref(),
+            Some("第二次")
+        );
+    }
+
+    #[test]
+    fn search_cache_key_isolates_source_channel_and_page() {
+        let mut filter = fake_filter();
+        let base = search_cache_key(&filter, "战神");
+
+        let mut other = filter.clone();
+        other.source = Some("guo_x".into());
+        assert_ne!(
+            search_cache_key(&other, "战神"),
+            base,
+            "source 不同必须换 key"
+        );
+
+        let mut other = filter.clone();
+        other.channel = "comic".into();
+        assert_ne!(
+            search_cache_key(&other, "战神"),
+            base,
+            "channel 不同必须换 key"
+        );
+
+        filter.page = 2;
+        assert_ne!(
+            search_cache_key(&filter, "战神"),
+            base,
+            "page 不同必须换 key"
+        );
+
+        assert_ne!(
+            search_cache_key(&filter, "战神的哥哥"),
+            base,
+            "关键词不同必须换 key"
+        );
+    }
+
+    #[test]
+    fn enabled_sources_drop_unknown_ids_and_duplicates() {
+        let input = vec![
+            "hongguo".to_string(),
+            // 已下架的站源：留在历史设置里是事实，但**不能再进启用列表** ——
+            // 重新进列表就会重新参与聚合，等于把下架撤销了。
+            " heguo ".to_string(),
+            "hongguo".to_string(),
+            "不存在的源".to_string(),
+            "".to_string(),
+        ];
+        // 2026-11-02 语义：列表基准是内置源（红果），用户输入只能往里补
+        // **已安装的插件源**。所以这里只剩 hongguo。
+        assert_eq!(
+            normalize_enabled_sources(&input),
+            vec!["hongguo".to_string()]
+        );
+    }
+
+    #[test]
+    fn enabled_sources_fall_back_to_hongguo_when_all_rejected() {
+        // 全是脏 id / 空串时不能存成空列表：那会让前端一个源都不请求，首页全空。
+        let input = vec!["不存在".to_string(), "  ".to_string()];
+        assert_eq!(
+            normalize_enabled_sources(&input),
+            vec!["hongguo".to_string()]
+        );
+        assert_eq!(normalize_enabled_sources(&[]), vec!["hongguo".to_string()]);
+    }
+
+    /// 目录/搜索类入口的门闩：受控源被关掉时**静默回落红果**（置空 source），
+    /// 而不是报错。
+    #[test]
+    fn gated_source_falls_back_to_hongguo_instead_of_failing() {
+        // 总开关关闭 + 18+ 源 → 置空，调用方据此走红果官网链路。
+        for source in [
+            "dsd",
+            "huangdou",
+            "huangju",
+            "yeguo",
+            "huangguoai",
+            "huangguo-video",
+        ] {
+            assert_eq!(
+                gated_source(Some(source), false),
+                None,
+                "{source} 被关掉时应静默回落，不能带着它继续打 guo-core"
+            );
+        }
+        // 总开关开启 → 原样透传。
+        assert_eq!(gated_source(Some("dsd"), true), Some("dsd".to_owned()));
+        // 常规源（红果自己、其余 guo 源）两种状态下都不受影响。
+        assert_eq!(
+            gated_source(Some("hongguo"), false),
+            Some("hongguo".to_owned())
+        );
+        assert_eq!(gated_source(Some("heguo"), false), Some("heguo".to_owned()));
+        // 本来就没有 source（红果原生链路）不能被门闩改成别的。
+        assert_eq!(gated_source(None, false), None);
+        assert_eq!(gated_source(None, true), None);
+    }
+
+    /// 按 id 直达类入口的门闩：受控源被关掉时**报错**。
+    ///
+    /// 这里与 `gated_source` 分道扬镳是刻意的：用户此刻正拿着一部被禁的剧，
+    /// 静默放行等于"照播了但你看不见"，报错才是正确结果。
+    #[test]
+    fn series_source_allowed_blocks_disabled_adult_series_only() {
+        // 关闭 + 18+ 源剧集 → 拒。
+        for series_id in ["guo:dsd:1", "guo:huangdou:abc", "guo:huangguo-video:x:1"] {
+            assert!(
+                !series_source_allowed(series_id, false),
+                "{series_id} 属于被关掉的 18+ 源，必须挡住"
+            );
+        }
+        // 开启 → 全放行。
+        assert!(series_source_allowed("guo:dsd:1", true));
+        // 关闭 + 常规源 / 非 guo 剧集 → 放行（红果、动漫的 id 都不能被误伤）。
+        assert!(series_source_allowed("guo:heguo:1", false));
+        assert!(series_source_allowed("guo:hongguo:1", false));
+        assert!(series_source_allowed("dmghg:9999", false));
+        assert!(series_source_allowed("12345", false));
+    }
+
+    /// `settings_save` 的启用列表归一化，以及"为什么不剔除 18+ 源"的护栏。
+    ///
+    /// 归一化做三件事：去重、丢弃未知 id、全空回落红果（否则会存下一个零可用源的
+    /// 设置，首页一个请求都没有）。
+    ///
+    /// 断言的重点在最后一条：开关关闭时 **18+ 源仍留在启用列表里**。这是刻意的
+    /// （设置页关闭总开关是"置灰"不是"取消勾选"，取消是用户没要求的数据丢失）；
+    /// 内容侧由 `series_source_allowed` / `gated_source` 按请求拦，磁盘上留个源 id
+    /// 拿不到任何内容。写死这条是为了防止下一个人看到"关着开关还启用着帝果"就
+    /// 顺手加回剔除。
+    #[test]
+    fn settings_save_keeps_only_builtin_sources() {
+        let mixed = UserSettings {
+            show_adult_sources: false,
+            enabled_sources: vec![
+                "dsd".to_string(),
+                "heguo".to_string(),
+                "huangguo-video".to_string(),
+                "hongguo".to_string(),
+                "不存在的源".to_string(),
+            ],
+            ..UserSettings::default()
+        };
+        // 2026-11-02：已下架的站源（dsd / heguo / huangguo-video）不再进启用列表——
+        // 保留它们等于让聚合继续打这些站点。内置源红果恒定在列。
+        // 旧断言是"18+ 源原样保留"，那是在这些源还内置的年代；语义已随之改变。
+        assert_eq!(
+            normalize_enabled_sources(&mixed.enabled_sources),
+            vec!["hongguo".to_string()]
+        );
+
+        // 全空（含全是被丢弃的未知 id）时回落红果：零可用源等于坏设置。
+        assert_eq!(
+            normalize_enabled_sources(&["不存在-a".to_string(), "不存在-b".to_string()]),
+            vec!["hongguo".to_string()]
+        );
+        assert_eq!(normalize_enabled_sources(&[]), vec!["hongguo".to_string()]);
+
+        // 但守卫仍然拦得住：18+ 源的剧集 id 在开关关闭时一律不可达。
+        assert!(!series_source_allowed("guo:dsd:1", false));
+        assert!(!series_source_allowed("guo:huangguo-video:1", false));
+    }
+
+    #[test]
+    fn search_cache_entry_expires_after_ttl() {
+        let cache: SearchCache<CatalogPage> = SearchCache::new(Duration::from_millis(0));
+        cache.put("k".into(), fake_page("过期"));
+        assert!(cache.get("k").is_none());
+    }
+
+    #[test]
+    fn search_cache_clears_when_capacity_reached() {
+        let cache: SearchCache<CatalogPage> = SearchCache::new(Duration::from_secs(300));
+        for index in 0..SEARCH_CACHE_CAPACITY {
+            cache.put(format!("k{index}"), fake_page("满"));
+        }
+        cache.put("k0".into(), fake_page("触发清空"));
+        // 容量到顶就整表清空：先写的那批全部消失，只剩触发清空后写入的这一条。
+        assert!(cache.get("k1").is_none());
+        assert_eq!(
+            cache.get("k0").map(|page| page.source).as_deref(),
+            Some("触发清空")
+        );
+    }
+
+    #[test]
+    fn suggest_cache_key_isolates_channel() {
+        assert_ne!(
+            suggest_cache_key("战神", "drama"),
+            suggest_cache_key("战神", "comic")
+        );
+    }
+}

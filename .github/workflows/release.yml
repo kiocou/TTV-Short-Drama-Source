@@ -1,0 +1,211 @@
+name: Release Multi-Platform
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.0.1; leave empty to use v<tauri.conf.json version>)"
+        required: false
+        type: string
+      publish_release:
+        description: "Publish installers to GitHub Release"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Prepare Release Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      publish: ${{ steps.meta.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            PUBLISH="true"
+          else
+            INPUT_TAG="${{ inputs.tag }}"
+            if [[ -n "$INPUT_TAG" ]]; then
+              TAG="$INPUT_TAG"
+            else
+              CONF_VER=$(node -e "console.log(require('./src-tauri/tauri.conf.json').version)")
+              TAG="v${CONF_VER}"
+            fi
+            PUBLISH="${{ inputs.publish_release }}"
+          fi
+          VERSION="${TAG#v}"
+          VERSION="${VERSION#V}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "publish=${PUBLISH}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract changelog notes
+        shell: node {0}
+        run: |
+          const fs = require('node:fs');
+          const version = '${{ steps.meta.outputs.version }}';
+          const changelog = fs.readFileSync('CHANGELOG.md', 'utf8').replace(/\r\n/g, '\n');
+          const escaped = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const blockMatch = changelog.match(new RegExp(`^##\\s+${escaped}\\b[\\s\\S]*?(?=\\n##\\s|(?![\\s\\S]))`, 'm'));
+          if (!blockMatch) {
+            throw new Error(`CHANGELOG.md 缺少 ${version} 章节`);
+          }
+          const heading = blockMatch[0].split('\n', 1)[0].trim();
+          const sections = [];
+          for (const title of ['新增', '修复', '删除', '优化']) {
+            const sec = blockMatch[0].match(new RegExp(`^###\\s+${title}\\s*$[\\s\\S]*?(?=\\n###\\s|\\n##\\s|(?![\\s\\S]))`, 'm'));
+            if (!sec) {
+              throw new Error(`CHANGELOG.md ${version} 缺少「${title}」小节`);
+            }
+            sections.push(sec[0].trim());
+          }
+          const notes = [
+            `> 提交 ${process.env.GITHUB_SHA.slice(0, 7)} ｜ 支持平台：Windows (x64 / ARM64) · macOS (Apple Silicon / Intel)`,
+            '',
+            heading,
+            '',
+            sections.join('\n\n'),
+            '',
+          ].join('\n');
+          fs.writeFileSync('release-notes.md', notes, 'utf8');
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          retention-days: 7
+
+  build:
+    name: Build (${{ matrix.label }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            tauri_args: "--target x86_64-pc-windows-msvc --bundles nsis"
+            bundle_glob: "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe"
+          - label: windows-arm64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            tauri_args: "--target aarch64-pc-windows-msvc --bundles nsis"
+            bundle_glob: "src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*-setup.exe"
+          - label: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            tauri_args: "--target aarch64-apple-darwin --config src-tauri/tauri.macos.conf.json --bundles dmg"
+            bundle_glob: "src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg"
+          - label: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            tauri_args: "--target x86_64-apple-darwin --config src-tauri/tauri.macos.conf.json --bundles dmg"
+            bundle_glob: "src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+          key: release-${{ matrix.label }}
+
+      - name: Verify no research artifacts in bundle paths
+        shell: bash
+        run: |
+          if [[ -e src-tauri/resources/re_analysis || -e public/re_analysis ]]; then
+            echo "Error: re_analysis leaked into bundle directory"
+            exit 1
+          fi
+
+      - name: Build Tauri bundle (${{ matrix.label }})
+        run: npx tauri build ${{ matrix.tauri_args }}
+
+      - name: Stage installer artifact & check GitHub 100 MB limit
+        shell: bash
+        run: |
+          mkdir -p dist-installers
+          shopt -s nullglob
+          files=(${{ matrix.bundle_glob }})
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No installer matched ${{ matrix.bundle_glob }}"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            size=$(wc -c < "$f")
+            echo "Found installer: $f ($size bytes)"
+            if (( size >= 104857600 )); then
+              echo "Error: $f exceeds GitHub Release 100 MB single-file limit"
+              exit 1
+            fi
+            cp "$f" dist-installers/
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.label }}
+          path: dist-installers/*
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          ASSETS=()
+          while IFS= read -r -d '' f; do
+            ASSETS+=("$f")
+          done < <(find artifacts/installer-* -type f -print0 | sort -z)
+          if [[ ${#ASSETS[@]} -eq 0 ]]; then
+            echo "No installers found to publish"
+            exit 1
+          fi
+          NOTES="artifacts/release-notes/release-notes.md"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "TTV Short Drama $TAG" --notes-file "$NOTES"
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+          else
+            gh release create "$TAG" "${ASSETS[@]}" --target "$TARGET_SHA" --title "TTV Short Drama $TAG" --notes-file "$NOTES"
+          fi

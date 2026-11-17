@@ -1,0 +1,696 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogFilter {
+    pub channel: String,
+    /// 外部 guoapp 站源 id；为空表示沿用红果短剧/漫剧链路。
+    #[serde(default)]
+    pub source: Option<String>,
+    pub category: String,
+    pub audience: String,
+    pub sort: String,
+    pub keyword: Option<String>,
+    pub page: u32,
+    pub page_size: u32,
+    pub cursor: Option<String>,
+}
+
+/// 目录/货架里的一张剧集卡。
+///
+/// `Deserialize` 是给**磁盘缓存**用的（`short_drama_app::read_shelf_cache`
+/// 要把落盘的 JSON 读回来）。加上它不影响 Tauri 命令的序列化契约 ——
+/// 命令出口只用 `Serialize`，多实现一个 trait 不会改变线上格式。
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesItem {
+    pub id: String,
+    pub title: String,
+    pub cover: String,
+    #[serde(rename = "type")]
+    pub item_type: String,
+    pub episodes_count: u32,
+    pub latest_episode_title: Option<String>,
+    pub tags: Vec<String>,
+    pub origin: String,
+    pub brief: Option<String>,
+    /// 站点给出的用户评分，**0-10 量纲**，原样透传不换算。
+    ///
+    /// 站点不给就是 `None`，**绝不能填 0**：前端 `SeriesCard` 是
+    /// `{series.rating && …}`，填 0 既渲染成"0.0 分"角标，又是凭空造分
+    /// （不变量 8：不要把不存在的东西显示成可用）。
+    ///
+    /// `#[serde(default)]` 对当前只 `Serialize` 的结构体其实不生效（它只管反序列化），
+    /// 留着是为了哪天给这个结构体补 `Deserialize`（旧缓存 / 旧快照）时不必再改这里。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rating: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogPage {
+    pub items: Vec<SeriesItem>,
+    pub total: usize,
+    pub has_more: bool,
+    pub page: u32,
+    pub categories: Vec<String>,
+    pub next_cursor: Option<String>,
+    pub source: String,
+    /// **这份结果是降级的**：有来源失败或结果不完整，但仍然返回了内容。
+    ///
+    /// 为什么不能只靠 `source` 里那句文案（"；动漫来源暂不可用"）：前端判定要靠
+    /// 字符串词表（`不可用`/`可重试`/…），而**用户搜的词本身可能含这些字**，
+    /// 于是正常来源行会被染成琥珀色。`degraded` 只回答"这次结果可不可信"。
+    ///
+    /// 真正的多来源合并发生在 `main.rs::merge_search_sources`，它在那儿置位；
+    /// 各 provider 内部的部分成功（见 `provider.rs` 的四处）也各自置位。
+    /// 失败即整体 `Err` 的链路填 `false`。
+    ///
+    /// **不要** `skip_serializing_if`：这是常量语义、没有"缺失"这一说，
+    /// 恒定出现在载荷里前端才能直接读，不用判 undefined。
+    /// 同上，`#[serde(default)]` 现在不生效，是留给将来 `Deserialize` 的。
+    #[serde(default)]
+    pub degraded: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpisodeItem {
+    pub id: String,
+    pub series_id: String,
+    pub episode_number: u32,
+    pub title: String,
+    pub duration_seconds: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoQualityOption {
+    pub label: String,
+    pub value: String,
+    pub resolution: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesDetail {
+    pub id: String,
+    pub title: String,
+    pub cover: String,
+    #[serde(rename = "type")]
+    pub item_type: String,
+    pub tags: Vec<String>,
+    pub origin: String,
+    pub episodes_count: u32,
+    pub description: String,
+    pub episodes: Vec<EpisodeItem>,
+    /// 真正能播的集数上限：`episodes[0..playable_episodes]` 之外的集**播不出来**。
+    ///
+    /// 为什么不能拿 `episodes_count` 当边界（2026-11-09 实测）：
+    /// 红果详情页的 `episode_cnt` 与 `vid_list.len()` 都是**全集数**（实测一部剧
+    /// 102），而 `accessible_episode_cnt` 只有 **5**——后 97 集是未开放/待付费，
+    /// 但播放页对它们同样返回 200 + 一份完整 HTML（字节数与第 1 集几乎一致），
+    /// 于是"点进去播不出"不会报错，只会静默失败。
+    ///
+    /// 所以可播边界只能读 `accessible_episode_cnt` 这个权威策略字段。
+    /// `None` = 源没有给这个信号（动漫/云解析链路），此时前端按未知处理，
+    /// **不要**退化成"全部可播"——那等于把上面那个静默失败重新引回来。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playable_episodes: Option<u32>,
+    pub available_qualities: Vec<VideoQualityOption>,
+    pub sources: Vec<PlaybackSource>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackSource {
+    pub id: String,
+    pub name: String,
+    pub is_primary: bool,
+    pub health: String,
+    pub ping_ms: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackOpenInput {
+    pub session_id: u64,
+    pub series_id: String,
+    pub episode_id: String,
+    pub quality: String,
+    pub position: f64,
+    /// 动漫专区标记：动漫播放走暴风源直链（m3u8 经本地 HLS 代理），不经红果 worker。
+    #[serde(default)]
+    pub is_anime: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackSession {
+    pub session_id: u64,
+    pub series_id: String,
+    pub episode_id: String,
+    pub position: f64,
+    pub quality: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_url: Option<String>,
+    /// 源流形态（动漫链路与短剧/漫剧 H.264 增强流填）：
+    /// - `hls`：m3u8 播放列表，必须由 hls.js 挂到 MSE 上播放；
+    /// - `file`：整段可直连的媒体文件，直接交给 `<video src>`。
+    ///
+    /// 为什么必须由后端显式标出：动漫的每条地址都会被本地代理重写成
+    /// `http://127.0.0.1:port/stream?u=…`，前端 `isHlsUrl()` 里的
+    /// `url.includes('/stream?u=')` 因此**恒为 true**——整集 MP4 也会被塞给
+    /// hls.js（解析播放列表失败）。而 WebView2 的
+    /// `canPlayType('application/vnd.apple.mpegurl')` 返回 `"maybe"`，又让前端
+    /// 误以为"原生支持 HLS"，把 m3u8 直接喂给 `<video>`（实测 15 秒后
+    /// `videoWidth=0`、只有声音，20 秒后才可能出帧——即"有声无画黑屏"）。
+    /// 真值只在解析出地址的 Rust 侧可得，所以在改写地址之前判定并下发。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_kind: Option<String>,
+    /// 这条地址**只有一段试看**，不是整集。
+    ///
+    /// 专指红果公开网页那条 `/video/public/{vid}/360p.mp4`：实测三个不同 vid
+    /// （真人剧 / AI 剧各取一集）用 ffprobe 量出来**都是精确 10.000 秒**，而同一集
+    /// 的 `publicVideoSeo.durationSeconds` 是 173.354 —— 也就是说它是试看片段。
+    ///
+    /// 为什么必须显式标出来：这个片段能正常播放（Chromium 里 `loadedmetadata`
+    /// 成功、seek 也成功），只是时长 10 秒。如果把它当成整集交给播放器，用户
+    /// 看 10 秒就黑屏，会以为内容坏了——这比直接报错更难排查。
+    /// 前端据此走"如实报错/提示试看"，而不是当作正常播放。
+    ///
+    /// `false` 表示正常整集（App 链路 / 云解析 / 动漫）。老客户端不认识这个字段
+    /// 时按缺省 `false` 处理，与引入前的行为一致。
+    #[serde(default)]
+    pub preview_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackSnapshot {
+    pub session_id: u64,
+    pub state: PlaybackUiState,
+    pub position: f64,
+    pub duration: f64,
+    pub buffered: f64,
+    pub volume: f64,
+    pub muted: bool,
+    pub playback_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackUiState {
+    pub kind: String,
+    pub session_id: u64,
+}
+
+/// 宽容解析：`null`（以及缺失）一律当 0。
+///
+/// 为什么需要：前端把 `video.duration` 直接送进来，而分片 MP4 / 未知时长的源
+/// 在 WebView 里报 `Infinity`——`JSON.stringify` 会把它变成 `null`。这些字段
+/// 原本是必填 f64/u32/u8，一个 `null` 就让**整个参数反序列化失败**，
+/// `history_save` 被拒，用户看到的是"这集明明看了，历史里却没有"。
+/// 宁可记下 0 秒，也不能丢掉"看到哪一集"这个信息。
+fn de_f64_lenient<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or(0.0))
+}
+
+fn de_u32_lenient<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u32>::deserialize(deserializer)?.unwrap_or(0))
+}
+
+fn de_u8_lenient<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u8>::deserialize(deserializer)?
+        .unwrap_or(0)
+        .min(100))
+}
+
+fn de_i64_lenient<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or(0))
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchHistoryItem {
+    pub series_id: String,
+    pub episode_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub series_cover: String,
+    #[serde(default, deserialize_with = "de_u32_lenient")]
+    pub episode_number: u32,
+    #[serde(default, deserialize_with = "de_u32_lenient")]
+    pub total_episodes: u32,
+    #[serde(default, deserialize_with = "de_f64_lenient")]
+    pub position_seconds: f64,
+    #[serde(default, deserialize_with = "de_f64_lenient")]
+    pub duration_seconds: f64,
+    #[serde(default, deserialize_with = "de_u8_lenient")]
+    pub progress_percent: u8,
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    pub updated_at: i64,
+    pub is_finished: bool,
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub history_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserSettings {
+    pub default_quality: String,
+    pub auto_next: bool,
+    /// 已废弃：补帧/增强链路已移除，保留字段兼容旧设置库记录，恒为 "off"。
+    pub preferred_engine: String,
+    pub target_fps: u32,
+    /// 是否启用硬件加速（WebView2 GPU 合成）。
+    ///
+    /// 前端**没有**对应的界面开关，但前端 `UserSettings` 必须带上这个字段：
+    /// `settings_save` 的入参是反序列化出来的，缺字段会在反序列化阶段整体失败，
+    /// 命令体一行都不执行——连 `set_vsr_enabled` 都轮不到。历史上前端漏了它，
+    /// 表现就是「设置页怎么改都不落库、重启回默认」。
+    ///
+    /// 这里同时补 `default_true`：既要兼容更早的设置库记录，也要让将来任何
+    /// 漏字段的调用方最多丢掉这一个开关，而不是整条保存链路。
+    #[serde(default = "default_true")]
+    pub hardware_acceleration: bool,
+    /// **历史字段，恒为 0，不要拿它当缓存占用。**
+    ///
+    /// 真实占用由 `short_drama_app_cache_usage` 现场扫描
+    /// `short-series` / `motion-comic` / `rtx-vsr` 三个目录后返回，设置页显示的就是
+    /// 那个值（见 `short_drama_app.rs` 的 `cache_usage` 与前端 `settings.cacheUsage()`）。
+    /// 字段保留只为兼容旧设置库记录——前端 `UserSettings` 必须与后端同形，
+    /// 少一个字段会让 `settings_save` 反序列化整体失败。
+    pub catalog_cache_mb: f64,
+    pub playback_cache_mb: f64,
+    /// 是否展示 18+ 外部内容源（黄豆/剧果/野果/帝果/黄果 AI/黄果视频）。
+    ///
+    /// 旧设置记录里没有这个字段，serde default 保证升级后读取不会失败；
+    /// 默认关闭——成人内容源需要用户显式开启。
+    #[serde(default)]
+    pub show_adult_sources: bool,
+    /// 用户勾选启用的视频源 id（前端 `enabledSources`）。
+    ///
+    /// 存 id 列表而不是"逐源开关"：源表在前端（`services/guoSources.ts`），
+    /// 后端不需要知道有哪些源，也不需要在源增删时迁移设置。
+    ///
+    /// 空列表回落到 `["hongguo"]`——旧设置记录没有这个字段，若按空列表处理，
+    /// 升级后用户会看到"一个源都没有"的空目录。
+    #[serde(default)]
+    pub enabled_sources: Vec<String>,
+    /// 启动进入动画是否发声（合成音效 + 入场底噪）。
+    ///
+    /// 旧设置记录里没有这个字段：`#[serde(default)]` 对 bool 只会给 `false`，
+    /// 而这里要的默认是**开**，所以走 `default_true`。
+    /// 音频本身由前端用 Web Audio 现场合成（`src/services/launchAudio.ts`），
+    /// 后端只存这一个开关，不碰媒体链路。
+    #[serde(default = "default_true")]
+    pub launch_sound: bool,
+    /// 是否启用 RTX VSR 播放增强链路（非动漫的短剧/漫剧）。
+    ///
+    /// 开 = 源流经 `media_enhance` 转成 H.264 分片再播（让 NVIDIA 驱动触发
+    /// VSR；H.264 是本机 WebView2 触发 VSR 的硬条件，不变量 25），首次起播
+    /// 多一次转码；关 = 直接播原始源 URL，起播更快、没有增强。
+    ///
+    /// 旧设置记录里没有这个字段，而默认必须是**开**：现状（引入 media_enhance
+    /// 之后）默认就走 VSR 链路，默认关会让老用户升级后行为突变。
+    /// `#[serde(default)]` 对 bool 只会给 `false`，所以走 `default_true`。
+    #[serde(default = "default_true")]
+    pub vsr_enabled: bool,
+    /// 是否显示弹幕（红果 `/novel/commentapi/comment/list/` 的真实弹幕）。
+    ///
+    /// 纯前端渲染开关：后端只负责按时间窗取数据，是否显示、显示多大的密度
+    /// 全在 `components/player/DanmakuOverlay.tsx` 里决定。
+    ///
+    /// 默认**开**：既然做了这个功能，装好就该看到弹幕，而不是让用户先去设置页
+    /// 找一个开关才发现有这回事。旧设置记录没有这个字段，`default_true` 保证
+    /// 升级后不会被静默关掉。
+    #[serde(default = "default_true")]
+    pub danmaku_enabled: bool,
+    /// 弹幕观感设置（2026-11-07，播放器「弹幕设置」面板）。
+    ///
+    /// 这些值**只影响前端渲染**（`DanmakuOverlay`），后端既不解读也不参与播放
+    /// 链路——存在这里是因为设置落库走的是强类型 `UserSettings`，前端新增的
+    /// 可持久化字段必须在这张表上占位，否则 `settings_save` 反序列化时会把
+    /// 未知字段静默丢弃，用户拖完滑条一重启就回到默认值。
+    ///
+    /// 默认值与 `src/services/ipc.ts` 的 `DEFAULT_SETTINGS` 一一对应：
+    /// 区域 25%（窗口化播放器里等于旧的写死 4 行观感）、不透明度 100、
+    /// 字号 100、速度 1（适中 = 8s，即移植自真果鉴的原始飞行时长）。
+    #[serde(default = "default_danmaku_area")]
+    pub danmaku_area: f64,
+    #[serde(default = "default_danmaku_opacity")]
+    pub danmaku_opacity: f64,
+    #[serde(default = "default_danmaku_font_scale")]
+    pub danmaku_font_scale: f64,
+    #[serde(default = "default_danmaku_speed")]
+    pub danmaku_speed: i64,
+    #[serde(default = "default_danmaku_font")]
+    pub danmaku_font: String,
+    /// 弹幕文字颜色（#RRGGBB）。面板给色板 + 自定义取色器；非法值在
+    /// `settings_save` 归一回白色。
+    #[serde(default = "default_danmaku_color")]
+    pub danmaku_color: String,
+    /// 默认开：与引入设置前的 `fontWeight: 700` 一致，旧观感不变。
+    #[serde(default = "default_true")]
+    pub danmaku_bold: bool,
+    /// 重墨（默认）/ 描边 / 45°投影。非法值在 `settings_save` 归一回 heavy。
+    #[serde(default = "default_danmaku_stroke")]
+    pub danmaku_stroke: String,
+    /// 红果官网链路（`provider.rs` 的 `/category` 抓取）走不走系统代理。
+    ///
+    /// ## 为什么要做成用户可选项，而不是"自动判断"
+    ///
+    /// 自动判断已经试过两轮，两轮都栽在同一处：**取样时刻不一致**。
+    /// `DramaProvider::new()` 在进程启动时把注册表里的代理固化进连接器，
+    /// 而兜底逻辑却去问"此刻"的注册表。代理软件退出、`ProxyEnable` 翻成 0
+    /// 之后两者就对不上 —— 主客户端继续往没人监听的端口发请求（`10061`），
+    /// 而兜底又因为"当下没配代理"而不创建。
+    ///
+    /// 现在是**双保险**：启动时做一次 TCP 连通性探测把明显不通的代理判死
+    /// （`probe_proxy_on_startup`），同时把最终决定权交给用户 —— 有些环境
+    /// （企业网、非常规代理）自动探测必然判错，只有人能给出正确答案。
+    ///
+    /// 取值：`auto`（默认，探测可用才用）/ `direct`（永不走代理）/ `proxy`（总是走）。
+    /// 旧设置记录没有这个字段，serde default 给 `auto`，与修复前行为一致。
+    #[serde(default = "default_proxy_mode")]
+    pub proxy_mode: String,
+    /// 是否启用「智能体联动」：本地智能体工具（Claude Code / Codex / Gemini 等）
+    /// 的 hook 事件经本机桥（agent_bridge.rs）转发过来时，自动暂停正在播的
+    /// 短剧并弹呼叫卡片。
+    ///
+    /// 旧设置记录没有这个字段：默认必须是**关**——联动会暂停播放，属于用户必须
+    /// 显式选择的行为，默认开等于"装完应用剧就被暂停了"。与 launchSound /
+    /// vsrEnabled 的 default_true 正好相反，两者都各有注释说明理由。
+    #[serde(default)]
+    pub agent_watch_enabled: bool,
+    /// 「自定义源」灰度开关（默认关）。
+    ///
+    /// ## 为什么默认关
+    ///
+    /// 自定义源（用户自填苹果 CMS 接口）目前只做到「登记 + 测试」：
+    /// `source_add` / `source_probe` 能跑，但发现页的目录、详情、播放都还没接。
+    /// 如果默认展示「添加视频源」，用户加完一堆源会发现首页什么都没多——
+    /// 那比不展示更糟。所以灰度期把它藏在设置页一行灰色开关后面。
+    ///
+    /// 接进目录聚合之后再把默认值改成 true（届时这条注释要一起改）。
+    #[serde(default)]
+    pub custom_sources_enabled: bool,
+    /// 播放内核：`webview`（默认，应用内 HTML 播放器）或 `mpv`（独立原生窗口）。
+    ///
+    /// 旧设置记录没有这个字段。默认必须是 webview——原生窗口是用户显式选择
+    /// 的第二条通路，默认 mpv 会让老用户升级后「点播放却弹出另一个窗口」。
+    #[serde(default = "default_preferred_player")]
+    pub preferred_player: String,
+    /// 「短剧推荐」（竖滑流）开关（已正式全量开放）。
+    ///
+    /// 前端 `UserSettings` 必须与这里同形——少一个字段会让 `settings_save`
+    /// 反序列化整体失败，现象是「设置页怎么改都不落库」（详见 hardware_acceleration 的注释）。
+    #[serde(default = "default_true")]
+    pub feed_enabled: bool,
+    /// 独立 MPV 原生播放器灰度开关，默认**关**。
+    ///
+    /// 关着时 `settings_save` 会把 `preferred_player` 归一成 `webview`，
+    /// 保证任何旧记录里的 `mpv` 都不会再弹出一个独立窗口。
+    #[serde(default = "default_true")]
+    pub native_player_enabled: bool,
+}
+
+/// `proxy_mode` 的默认值。抽成函数是因为 `#[serde(default = "...")]` 只接受路径。
+fn default_proxy_mode() -> String {
+    "auto".into()
+}
+
+fn default_preferred_player() -> String {
+    "webview".into()
+}
+
+/// 弹幕观感默认值（与前端 `DEFAULT_SETTINGS` 对齐，理由见字段注释）。
+fn default_danmaku_area() -> f64 {
+    25.0
+}
+fn default_danmaku_opacity() -> f64 {
+    100.0
+}
+fn default_danmaku_font_scale() -> f64 {
+    100.0
+}
+fn default_danmaku_speed() -> i64 {
+    1
+}
+fn default_danmaku_font() -> String {
+    "Microsoft YaHei".into()
+}
+fn default_danmaku_color() -> String {
+    "#FFFFFF".into()
+}
+fn default_danmaku_stroke() -> String {
+    "heavy".into()
+}
+
+/// `#[serde(default)]` 对 bool 只会给 `false`；需要默认为真的字段走这个。
+fn default_true() -> bool {
+    true
+}
+
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self {
+            default_quality: "auto".into(),
+            auto_next: true,
+            preferred_engine: "off".into(),
+            target_fps: 60,
+            hardware_acceleration: true,
+            catalog_cache_mb: 0.0,
+            playback_cache_mb: 1024.0,
+            show_adult_sources: false,
+            enabled_sources: vec!["hongguo".to_string()],
+            launch_sound: true,
+            vsr_enabled: true,
+            danmaku_enabled: true,
+            danmaku_area: 25.0,
+            danmaku_opacity: 100.0,
+            danmaku_font_scale: 100.0,
+            danmaku_speed: 1,
+            danmaku_font: "Microsoft YaHei".into(),
+            danmaku_color: "#FFFFFF".into(),
+            danmaku_bold: true,
+            danmaku_stroke: "heavy".into(),
+            proxy_mode: "auto".into(),
+            agent_watch_enabled: false,
+            custom_sources_enabled: false,
+            preferred_player: "webview".into(),
+            feed_enabled: true,
+            native_player_enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheClearResult {
+    pub freed_mb: f64,
+}
+
+/// 追剧收藏条目（想看 / 在看 / 已看）。
+///
+/// 状态语义与历史记录独立：收藏是用户主动标记，`mark` 只有三种取值，
+/// 由存储层校验，未知值入库时报错而不是静默改写。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FavoriteItem {
+    pub series_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub cover: String,
+    /// want / watching / done
+    pub mark: String,
+    /// 漫剧 comic / 短剧 drama，用于收藏页分组筛选。
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    pub updated_at: i64,
+}
+
+#[cfg(test)]
+mod history_payload_tests {
+    use super::WatchHistoryItem;
+
+    /// `null` 数值不能再让整条历史记录被拒收。
+    ///
+    /// 这是"漫剧播完历史页里根本没有这条记录"的根因回归测试：前端把
+    /// `video.duration` 原样上报，而分片 MP4 在 WebView 里报 `Infinity`，
+    /// `JSON.stringify` 把它变成 `null`。字段原本是必填 f64/u32/u8，
+    /// 一个 `null` 就让整个 `history_save` 参数反序列化失败——记录一条都写不进去。
+    #[test]
+    fn accepts_null_numeric_fields() {
+        let json = r#"{
+            "seriesId": "s1",
+            "episodeId": "e1",
+            "title": "漫剧",
+            "seriesCover": "",
+            "episodeNumber": null,
+            "totalEpisodes": null,
+            "positionSeconds": null,
+            "durationSeconds": null,
+            "progressPercent": null,
+            "updatedAt": null,
+            "isFinished": false,
+            "channel": "comic"
+        }"#;
+        let item: WatchHistoryItem =
+            serde_json::from_str(json).expect("null 数值必须被宽容接受，否则整条记录丢失");
+        assert_eq!(item.position_seconds, 0.0);
+        assert_eq!(item.duration_seconds, 0.0);
+        assert_eq!(item.progress_percent, 0);
+        assert_eq!(item.episode_number, 0);
+        assert_eq!(item.updated_at, 0);
+        assert_eq!(item.channel.as_deref(), Some("comic"));
+    }
+
+    /// 正常的完整载荷必须照常解析，且百分比被夹在 0-100。
+    #[test]
+    fn accepts_well_formed_payload_and_clamps_percent() {
+        let json = r#"{
+            "seriesId": "s2",
+            "episodeId": "e2",
+            "title": "短剧",
+            "seriesCover": "https://example.com/c.jpg",
+            "episodeNumber": 7,
+            "totalEpisodes": 80,
+            "positionSeconds": 42.5,
+            "durationSeconds": 90.0,
+            "progressPercent": 250,
+            "updatedAt": 1700000000000,
+            "isFinished": false
+        }"#;
+        let item: WatchHistoryItem = serde_json::from_str(json).expect("正常载荷必须可解析");
+        assert_eq!(item.episode_number, 7);
+        assert_eq!(item.total_episodes, 80);
+        assert!((item.position_seconds - 42.5).abs() < f64::EPSILON);
+        assert_eq!(
+            item.progress_percent, 100,
+            "百分比必须夹在 0-100，否则 u8 会溢出"
+        );
+        assert!(item.channel.is_none());
+    }
+}
+
+/// `vsrEnabled` 的旧记录兼容：字段缺失必须落到「开」。
+///
+/// 这是「默认开」策略的回归测试：现存用户的设置库里没有这个字段，若 serde 走
+/// `bool` 的零值 `false`，升级后所有人的播放链路会**静默降级**——转码消失、VSR
+/// 消失，而界面上开关却显示为开（前端按 `!== false` 判定）。两侧必须一致。
+#[cfg(test)]
+mod vsr_settings_tests {
+    use super::UserSettings;
+
+    /// 只带必填字段的旧记录（没有任何新字段）→ vsr_enabled 必须为 true。
+    #[test]
+    fn legacy_record_without_vsr_field_defaults_to_enabled() {
+        let json = r#"{
+            "defaultQuality": "auto",
+            "autoNext": true,
+            "preferredEngine": "off",
+            "targetFps": 60,
+            "hardwareAcceleration": true,
+            "catalogCacheMb": 0.0,
+            "playbackCacheMb": 1024.0
+        }"#;
+        let settings: UserSettings =
+            serde_json::from_str(json).expect("旧设置记录必须仍能反序列化");
+        assert!(
+            settings.vsr_enabled,
+            "缺字段时必须默认开：默认关会让老用户的播放链路静默降级"
+        );
+    }
+
+    // 缺 hardwareAcceleration 的记录也必须能反序列化。
+    //
+    // 回归用例：这个字段既没有 serde default、前端 UserSettings 也一直漏了它，
+    // 于是 settings_save 会在反序列化阶段整体失败、命令体一行都不执行 ——
+    // 表现为「设置页怎么改都不落库、重启回默认」，而且 set_vsr_enabled 也一并没跑，
+    // 用户看到的正是「开关 VSR 都没用」。
+    //
+    // 现在两侧都补上了：这里用 default_true 兜住任何漏字段的调用方，
+    // 前端 types/settings.ts 与 DEFAULT_SETTINGS 补齐字段保持同形。
+    #[test]
+    fn legacy_record_without_hardware_acceleration_still_parses() {
+        let value = serde_json::json!({
+            "defaultQuality": "auto",
+            "autoNext": true,
+            "preferredEngine": "off",
+            "targetFps": 60,
+            "catalogCacheMb": 0.0,
+            "playbackCacheMb": 1024.0
+        });
+        let settings: UserSettings =
+            serde_json::from_value(value).expect("缺 hardwareAcceleration 也必须能解析");
+        assert!(
+            settings.hardware_acceleration,
+            "缺字段时按默认开启，而不是让整条保存链路失败"
+        );
+    }
+
+    // 显式关闭必须被如实接受（开关要真的能关）。
+    #[test]
+    fn explicit_false_is_honored() {
+        let json = r#"{
+            "defaultQuality": "auto",
+            "autoNext": true,
+            "preferredEngine": "off",
+            "targetFps": 60,
+            "hardwareAcceleration": true,
+            "catalogCacheMb": 0.0,
+            "playbackCacheMb": 1024.0,
+            "vsrEnabled": false
+        }"#;
+        let settings: UserSettings = serde_json::from_str(json).expect("显式 false 必须可解析");
+        assert!(!settings.vsr_enabled, "用户关掉开关后必须真的关掉");
+    }
+
+    /// `Default::default()` 是新建库的初值，必须与 serde default 一致。
+    #[test]
+    fn default_impl_matches_serde_default() {
+        assert!(UserSettings::default().vsr_enabled);
+        assert_eq!(UserSettings::default().preferred_player, "webview");
+    }
+
+    #[test]
+    fn legacy_record_without_preferred_player_defaults_to_webview() {
+        let json = r#"{
+            "defaultQuality": "auto",
+            "autoNext": true,
+            "preferredEngine": "off",
+            "targetFps": 60,
+            "hardwareAcceleration": true,
+            "catalogCacheMb": 0.0,
+            "playbackCacheMb": 1024.0
+        }"#;
+        let settings: UserSettings =
+            serde_json::from_str(json).expect("旧设置记录必须仍能反序列化");
+        assert_eq!(
+            settings.preferred_player, "webview",
+            "缺字段时必须回落到网页播放器，不能突然弹出外部窗口"
+        );
+    }
+}

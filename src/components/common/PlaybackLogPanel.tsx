@@ -1,0 +1,324 @@
+/**
+ * 播放诊断日志面板（设置页内嵌）。
+ *
+ * 存在理由：用户报的两个问题（「视频首次加载很长时间」「开关 VSR 都没用」）都只
+ * 在用户自己的机器上发生，开发机复现不出来。后端 trace.rs 早就在写
+ * `%LOCALAPPDATA%\com.ttv.shortdrama\ttv-playback.log`，但让用户去翻文件等于没有
+ * 诊断——日志必须在应用里能看见、能复制、能导出，才能做到「根据日志一步一步优化」。
+ *
+ * 三个刻意的实现选择：
+ *   1. **增量拉取**：用 trace_tail 的 nextCursor 游标，只取新增行。每次传 0 会每
+ *      1.5 秒把 2000 行全量搬过 IPC 一遍，反而把诊断工具本身变成卡顿源。
+ *   2. **渲染上限**：只在 DOM 里保留最后 MAX_RENDER_LINES 行。日志本身有 2000 行
+ *      环形上限，但面板可能开着几十分钟，不设上限会让这个常驻页面的 DOM 一直长。
+ *   3. **手动上滚即暂停自动滚底**：否则用户往回看的时候会被新行不断顶走。
+ *
+ * 不引入任何常驻合成层动画（AGENTS.md 不变量 26）：设置页是常驻 DOM，一个
+ * forwards 的 opacity/transform 会被永久钉住，历史上因此让 NVIDIA VSR 失效过。
+ */
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { ipcService } from '../../services/ipc';
+import { useSettingsStore } from '../../stores/useSettingsStore';
+import { usePlaybackStore } from '../../stores/usePlaybackStore';
+import { FluentButton } from './FluentButton';
+import { Check, ChevronDown, ClipboardCopy, Download, Trash2 } from 'lucide-react';
+
+/**
+ * 操作反馈的停留时长（毫秒）。
+ *
+ * 2.5 秒是"读得完一行短句、又不至于赖着不走"的区间。比全局 toast 的 2.8s
+ * 短一点是有意的：这条反馈就贴在按钮旁边，用户的目光还在原地，不需要那么久
+ * 去找它；而 toast 出现在右上角，需要一次视线转移，得多留一会儿。
+ */
+const STATUS_HOLD_MS = 2500;
+
+/** 解析阶段 → 用户可读文案（与播放器原先的阶段表同一份口径）。 */
+const STAGE_LABEL: Record<string, string> = {
+  start: '正在启动云端解析…',
+  sign: '正在校验播放凭据…',
+  model: '正在获取播放信息…',
+  fallback: '正在获取分集直链…',
+  download: '正在缓存本集…',
+  transcode: '正在转换格式…',
+};
+
+/**
+ * 实时解析状态条。播放器界面只显示"缓冲中…"，阶段/百分比在这里展开。
+ *
+ * 独立成组件并且只在展开时挂载：设置页是常驻 DOM，若在 PlaybackLogPanel 本体
+ * 订阅整表播放状态，它会跟着 position/buffered 每秒重渲染，而面板里可能挂着
+ * 800 行日志——本仓库反复踩过"隐藏视图也在重渲染"这个坑。
+ */
+const LivePrepareStatus: React.FC = () => {
+  const { prepareStatus, isSwitching, currentEpisode } = usePlaybackStore();
+  if (!prepareStatus) return null;
+  return (
+    <div className="rounded-lg border border-blue-200/70 bg-blue-50/70 px-3 py-2 flex flex-col gap-1.5">
+      <div className="flex items-center gap-2 text-[11px]">
+        <span className="font-semibold text-blue-700">
+          {isSwitching && currentEpisode ? `切换到第 ${currentEpisode.episodeNumber} 集` : '当前解析'}
+        </span>
+        <span className="text-slate-600">
+          {prepareStatus.message || STAGE_LABEL[prepareStatus.stage] || '正在准备播放源…'}
+        </span>
+        {prepareStatus.percent != null && (
+          <span className="ml-auto font-mono text-blue-700">{prepareStatus.percent}%</span>
+        )}
+      </div>
+      <div className="h-1 w-full overflow-hidden rounded-full bg-blue-200/70">
+        {prepareStatus.percent != null ? (
+          <div
+            className="h-full rounded-full bg-blue-500 transition-[width] duration-300 ease-out"
+            style={{ width: `${Math.min(100, Math.max(0, prepareStatus.percent))}%` }}
+          />
+        ) : (
+          <div className="h-full w-1/3 rounded-full bg-blue-500 animate-[eta-slide_1.1s_ease-in-out_infinite]" />
+        )}
+      </div>
+    </div>
+  );
+};
+
+/** 轮询间隔。1.5s 足够跟上起播链路（毫秒级打点会几行一起到），又不至于刷屏。 */
+const POLL_MS = 1500;
+/** DOM 里最多保留的行数。 */
+const MAX_RENDER_LINES = 800;
+
+/** 单行着色：越接近「出问题了」越显眼，正常链路保持安静。 */
+function lineClass(line: string): string {
+  if (line.includes('失败') || line.includes('错误') || line.includes('error')) return 'text-amber-300';
+  if (line.includes('[vsr]')) return 'text-sky-300';
+  if (line.includes('[ui]')) return 'text-emerald-300';
+  return 'text-slate-300';
+}
+
+export const PlaybackLogPanel: React.FC = () => {
+  const { settings } = useSettingsStore();
+  const [open, setOpen] = useState(false);
+  const [lines, setLines] = useState<string[]>([]);
+  const [dropped, setDropped] = useState(false);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [status, setStatus] = useState('');
+  /**
+   * 复制成功后的"对勾"态。与 `status` 分开是因为两者寿命不同、位置也不同：
+   * `status` 是行内绿字，`copied` 只驱动按钮自己的图标与文案。
+   */
+  const [copied, setCopied] = useState(false);
+  const cursorRef = useRef(0);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * 反馈自动熄灭的定时器。
+   *
+   * ## 为什么必须有（2026-10-22 修「复制绿字永远挂在面板上」）
+   *
+   * 旧实现只有 `setStatus('已复制 N 行')`，**没有任何清除路径**——点一次
+   * 「复制全部」，那行绿字会一直挂到用户点别的按钮为止；如果用户只是复制完
+   * 就去粘贴、再回来看，会以为"还在复制中"或"点了没反应"。这不是设计优化，
+   * 是一个状态永生的缺陷。
+   *
+   * ## 为什么用 ref 存定时器而不是 useEffect 依赖 status
+   *
+   * 每次触发都要**重置**计时：连点两次复制，第二次应该重新数满 2.5 秒，而不是
+   * 沿用第一次的剩余时间（那会让第二次的反馈一闪而过）。用 effect 监听 status
+   * 做 cleanup 也能实现，但 status 是字符串，第二次设成同一个文案时 React 会
+   * 认为状态没变、不触发 effect，计时就不会重置——用显式 timer ref 才稳。
+   */
+  const statusTimerRef = useRef<number | null>(null);
+
+  const flashStatus = useCallback((text: string) => {
+    if (statusTimerRef.current !== null) window.clearTimeout(statusTimerRef.current);
+    setStatus(text);
+    statusTimerRef.current = window.setTimeout(() => {
+      setStatus('');
+      setCopied(false);
+      statusTimerRef.current = null;
+    }, STATUS_HOLD_MS);
+  }, []);
+
+  // 卸载时清掉定时器：设置页虽然常驻，但热更新/切主题重挂时留着会在已卸载的
+  // 组件上 setState。
+  useEffect(() => {
+    return () => {
+      if (statusTimerRef.current !== null) window.clearTimeout(statusTimerRef.current);
+    };
+  }, []);
+
+  // 在途守卫：轮询间隔是 1.5 秒，而一次 IPC 在机器忙（大量转码日志）时可能更慢。
+  // 没有这道守卫就会有两次 pull 并发，各自带着**同一个起始游标**发出，回来时后者
+  // 覆盖前者的 nextCursor —— 表现为日志面板里整段行凭空消失、或同一段重复出现。
+  const inFlightRef = useRef(false);
+
+  const pull = useCallback(async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    try {
+      const r = await ipcService.diagnostics.tail(cursorRef.current);
+      if (r.nextCursor !== cursorRef.current) cursorRef.current = r.nextCursor;
+      if (r.dropped) setDropped(true);
+      if (r.lines.length > 0) {
+        setLines(prev => {
+          const next = prev.concat(r.lines);
+          return next.length > MAX_RENDER_LINES ? next.slice(next.length - MAX_RENDER_LINES) : next;
+        });
+      }
+    } catch {
+      // IPC 失败（窗口正在关闭 / 后端忙）不该让面板卡在"正在拉取"状态。
+    } finally {
+      inFlightRef.current = false;
+    }
+  }, []);
+
+  // 只有展开时才轮询——折叠状态下不产生任何 IPC 流量。
+  useEffect(() => {
+    if (!open) return;
+    void pull();
+    const timer = setInterval(() => void pull(), POLL_MS);
+    return () => clearInterval(timer);
+  }, [open, pull]);
+
+  useEffect(() => {
+    if (!open || !autoScroll) return;
+    const box = boxRef.current;
+    if (box) box.scrollTop = box.scrollHeight;
+  }, [lines, open, autoScroll]);
+
+  const handleScroll = () => {
+    const box = boxRef.current;
+    if (!box) return;
+    // 距底部 24px 以内才算「在底部」，继续跟随。
+    setAutoScroll(box.scrollHeight - box.scrollTop - box.clientHeight < 24);
+  };
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'));
+      // 先亮对勾再落文案：对勾是"这一下成了"的即时确认，绿字是补充说明。
+      setCopied(true);
+      flashStatus(`已复制 ${lines.length} 行`);
+    } catch {
+      flashStatus('复制失败，请改用「导出日志」');
+    }
+  };
+
+  const handleExport = () => {
+    const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `ttv-playback-log-${Date.now()}.txt`;
+    a.click();
+    // 立刻 revoke 可能在下载真正开工前把 blob 撤掉（设置页里已有同样的坑记录）。
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    flashStatus('已导出');
+  };
+
+  const handleClear = async () => {
+    await ipcService.diagnostics.clear();
+    cursorRef.current = 0;
+    setLines([]);
+    setDropped(false);
+    flashStatus('已清空');
+  };
+
+  // 起播摘要：从已有行里倒着找最近一条起播相关记录，一眼看到这一集走的是哪条链路
+  // （HLS 转码 / 本地文件 / 直链）。
+  const lastStartLine = [...lines].reverse().find(l => l.includes('起播') || l.includes('就绪判定') || l.includes('resolve 完成'));
+
+  return (
+    <div className="pt-4 border-t border-black/[0.04]">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-xs font-semibold text-slate-800">播放诊断日志</div>
+          <div className="text-[11px] text-slate-400 leading-relaxed">
+            实时跟踪拉流、转存与起播全链路。遇到播放问题把它导出发我，就能按日志定位。
+          </div>
+        </div>
+        <FluentButton
+          variant="secondary"
+          size="sm"
+          icon={<ChevronDown className={`w-3.5 h-3.5 transition-transform ${open ? 'rotate-180' : ''}`} />}
+          onClick={() => setOpen(v => !v)}
+        >
+          {open ? '收起' : '展开'}
+        </FluentButton>
+      </div>
+
+      {/* Grid `0fr → 1fr` 折叠（见 index.css 的 `.ttv-collapse`）。
+          日志面板以前是 `{open && ...}` 条件渲染，展开/收起都是瞬切；换成
+          grid 后有了真实的展开动画，而且**不需要**给那个 h-56 的滚动盒子
+          量高度——`fr` 由浏览器按内容分配。
+
+          这里刻意保持"始终挂载"：日志行数有 MAX_RENDER_LINES 上限，DOM 量
+          受控；折叠后行高为 0，且内层 `content-visibility: auto` 让浏览器
+          跳过不可见部分的布局与绘制，不会因为"面板关着"而拖慢设置页。 */}
+      <div className={`ttv-collapse${open ? ' is-open' : ''}`} aria-hidden={!open}>
+        <div className="flex flex-col gap-2" style={{ contentVisibility: 'auto', paddingTop: '0.75rem' }}>
+          <LivePrepareStatus />
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-500">
+            <span>
+              RTX VSR：
+              <span className={settings.vsrEnabled !== false ? 'text-blue-600 font-semibold' : 'text-slate-500 font-semibold'}>
+                {settings.vsrEnabled !== false ? '开' : '关'}
+              </span>
+            </span>
+            <span>已显示行数：{lines.length}</span>
+            {dropped && <span className="text-amber-600">旧日志已被淘汰</span>}
+            {status && <span className="text-emerald-600">{status}</span>}
+          </div>
+
+          {lastStartLine && (
+            <div className="text-[11px] font-mono text-slate-600 bg-slate-50 rounded-lg px-2.5 py-1.5 break-all">
+              最近起播：{lastStartLine}
+            </div>
+          )}
+
+          <div
+            ref={boxRef}
+            onScroll={handleScroll}
+            className="h-56 overflow-y-auto rounded-lg bg-slate-900 px-3 py-2 font-mono text-[11px] leading-relaxed"
+          >
+            {lines.length === 0 ? (
+              <div className="text-slate-500">暂无日志。去播一集，这里会出现完整的拉流记录。</div>
+            ) : (
+              lines.map((line, index) => (
+                <div key={index} className={lineClass(line)}>
+                  {line}
+                </div>
+              ))
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {/* 复制按钮：成功后图标切对勾、文案切「已复制」，2.5 秒自动复位。
+                图标用条件渲染而不是 CSS 动画——设置页是常驻 DOM，任何带
+                `forwards` 的动画都会被永久钉住（AGENTS.md 不变量 26），
+                而这里只需要"换一张图"，一个三元表达式就够。
+                对勾带 `text-emerald-600`：颜色是确认语义的第二层编码，
+                不只靠形状，色弱用户也能分辨。 */}
+            <FluentButton
+              variant="secondary"
+              size="sm"
+              icon={
+                copied ? (
+                  <Check className="w-3.5 h-3.5 text-emerald-600" />
+                ) : (
+                  <ClipboardCopy className="w-3.5 h-3.5" />
+                )
+              }
+              onClick={handleCopy}
+            >
+              {copied ? '已复制' : '复制全部'}
+            </FluentButton>
+            <FluentButton variant="secondary" size="sm" icon={<Download className="w-3.5 h-3.5" />} onClick={handleExport}>
+              导出日志
+            </FluentButton>
+            <FluentButton variant="secondary" size="sm" icon={<Trash2 className="w-3.5 h-3.5" />} onClick={handleClear}>
+              清空
+            </FluentButton>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};

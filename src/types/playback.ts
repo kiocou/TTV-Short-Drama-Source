@@ -1,0 +1,50 @@
+export type PlaybackUiState =
+  | { kind: 'idle' }
+  | { kind: 'opening'; sessionId: number; episodeId: string }
+  | { kind: 'buffering'; sessionId: number; bufferedSeconds?: number }
+  | { kind: 'playing'; sessionId: number; position: number; duration?: number }
+  | { kind: 'recovering'; sessionId: number; attempt: number; reason: string }
+  | { kind: 'ended'; sessionId: number; nextEpisodeId?: string }
+  | { kind: 'error'; sessionId: number; code: string; recoverable: boolean };
+
+export interface PlaybackSession {
+  sessionId: number;
+  seriesId: string;
+  episodeId: string;
+  position: number;
+  quality: string;
+  url: string;
+  backupUrl?: string;
+  /**
+   * 这条地址**只有一段试看**，不是整集。
+   *
+   * 专指红果公开网页的 `/video/public/{vid}/360p.mp4`：实测三个不同 vid
+   * （真人剧 / AI 剧都取过）用 ffprobe 量出来**都是精确 10.000 秒**，而同一集的
+   * `publicVideoSeo.durationSeconds` 是 173.354。
+   *
+   * 它**能正常播放**（Chromium 里 `loadedmetadata` 与 seek 都成功），只是 10 秒
+   * 就结束。所以不能靠播放器报错来发现——必须由这个字段显式说明。
+   * 缺省（`undefined`/`false`）按整集处理，与引入该字段前的行为一致。
+   */
+  previewOnly?: boolean;
+  /**
+   * 源流形态（动漫链路与短剧/漫剧 H.264 增强流下发）。
+   *
+   * 为什么必须由后端给：动漫的所有地址都会经本地代理重写成 `/stream?u=…`，
+   * 前端无法从外观区分 m3u8 与整段 MP4；而 WebView2 的
+   * `canPlayType('application/vnd.apple.mpegurl')` 又谎报 `"maybe"`，
+   * 导致 m3u8 被直接喂给原生 `<video>`（15 秒后 `videoWidth=0`，只有声音）。
+   */
+  streamKind?: 'hls' | 'file';
+}
+
+export interface PlaybackSnapshot {
+  sessionId: number;
+  state: PlaybackUiState;
+  position: number;
+  duration: number;
+  buffered: number;
+  volume: number;
+  muted: boolean;
+  playbackRate: number;
+}

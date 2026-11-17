@@ -1,0 +1,123 @@
+TTV 短剧 · 视频源格式规范（v1）
+================================================================
+
+一、这个文件是干什么的
+----------------------------------------------------------------
+本文件定义「视频源」的标准写法。应用现在只有两个内置源（红果、动漫），
+其余来源由你自己添加：在 设置 → 视频源 → 添加视频源 里填表，或直接编辑
+本机源文件（见第六节）。添加前请按本文件的字段与约束填写。
+
+二、两种源
+----------------------------------------------------------------
+1. 内置源（固定，不可编辑/不可删除）
+   - hongguo  红果短剧 / 漫剧
+   - anime    动漫专区（动漫共和国优先，暴风资源兜底）
+
+2. 自定义源（你添加的）
+   走「苹果 CMS V10」标准接口。只要对方站点提供 /api.php/provide/vod/ 这类
+   接口，就能接进来。本应用对自定义源只做三件事：列目录、搜关键词、取详情。
+
+三、自定义源字段规范
+----------------------------------------------------------------
+一个源就是一个 JSON 对象。字段如下（★ 为必填）：
+
+★ id          string   源标识。小写字母/数字/-/_，2~40 字符，全局唯一。
+                        内置源已占用 hongguo / anime，不能重名。
+★ name        string   显示名。1~40 字符，例如「某某影视」。
+★ api         string   苹果 CMS 接口根地址，必须是 http(s):// 开头。
+                        例：https://example.com/api.php/provide/vod/
+                        应用会自动补 `?` 和查询参数，所以结尾带不带 `/` 都行。
+  enabled     boolean  是否启用，默认 true。
+  adult       boolean  是否成人内容，默认 false。为 true 的源默认不启用。
+  kind        string   live | comic | both，默认 both。
+                        live=真人短剧，comic=动漫，both=两种都有。
+  category    string   默认分类名（展示用），可留空。
+  typeId      string   苹果 CMS 的 t 参数（分类 id），可留空。
+                        例：39=动漫片，1=电影，2=连续剧（以对方站点为准）。
+  headers     object   额外请求头，可留空。例：{"Referer":"https://example.com/"}
+  note        string   备注，可留空。
+
+四、完整示例
+----------------------------------------------------------------
+{
+  "id": "demo-source",
+  "name": "示例影视",
+  "api": "https://example.com/api.php/provide/vod/",
+  "enabled": true,
+  "adult": false,
+  "kind": "both",
+  "category": "全部",
+  "typeId": "39",
+  "headers": {
+    "Referer": "https://example.com/"
+  },
+  "note": "示例，接入前请把 api 换成真实地址"
+}
+
+五、应用会怎样请求你的源
+----------------------------------------------------------------
+列表：GET {api}?ac=detail&t={typeId}&pg={page}
+搜索：GET {api}?ac=detail&wd={关键词}&pg={page}
+详情：GET {api}?ac=detail&ids={vod_id}
+
+期望响应是苹果 CMS 标准结构：
+{
+  "total": 54,
+  "pagecount": 3,
+  "list": [
+    {
+      "vod_id": 44871,
+      "vod_name": "示例剧名",
+      "vod_pic": "https://.../cover.jpg",
+      "vod_remarks": "更新至第6集",
+      "vod_play_from": "bfzym3u8",
+      "vod_play_url": "第1集$https://.../1.m3u8#第2集$https://.../2.m3u8"
+    }
+  ]
+}
+
+应用只读取上面这几个字段；缺少 vod_pic 时卡片显示剧名首字，缺少
+vod_play_url 时视为「暂不可播放」。
+
+六、本机源文件位置
+----------------------------------------------------------------
+%LOCALAPPDATA%\com.ttv.shortdrama\custom-sources.json
+
+结构是一个数组：[ {源1}, {源2} ]。手工编辑后保存即可，应用下次读取生效。
+删除某个源＝从数组里删掉那一项（或在设置页点删除）。
+
+七、已下架源的原始清单（历史数据，供参考）
+----------------------------------------------------------------
+下面 18 个源在 2026-11-02 随「源收敛」一起下架，内置列表里已不再出现。
+清单保留它们的 id / 名称 / 内容形态 / 分级，方便你按需重新接回来
+（接回来要填真实 api 地址；这些地址原本由内置的 guo-core 内部维护）。
+
+序号  id              名称        kind   18+   备注
+01    huangdou        黄豆        both   是    含"国漫"分类
+02    huangju         剧果        live   是
+03    yeguo           野果        live   是    已停用（超时）
+04    dsd             帝果        live   是
+05    huangguoai      黄果 AI     live   是    AI 生成
+06    huangguo-video  黄果视频    live   是    series/video 混合
+07    yaguo           芽果        live   否    曾报"未返回有效访问令牌"
+08    maoguo          猫果        live   否
+09    fanguo          饭果        live   否
+10    guanguo         观果        live   否    已停用（详情为空）
+11    heguo           河果        live   否
+12    xingguo         星果        live   否
+13    huaguo          花果        both   否    含《工资真相-动漫合集》
+14    niuguo          牛果        live   否    已停用（resolve 超时）
+15    wangguo         网果        live   否    曾 403
+16    faguo           发果        live   否    已停用（目录超时）
+17    piguo           皮果        live   否    已停用（域名解析失败）
+18    wuguo           伍果        live   否    集数恒为 1
+
+八、应用会做的校验
+----------------------------------------------------------------
+1. id 必填，且不能是 hongguo / anime（内置源占用）。
+2. name 不能为空。
+3. api 必填，必须是 http:// 或 https:// 开头；结尾的 `/` 会被规范成保留。
+4. kind 只认 live / comic / both，其它值按 both 处理。
+5. 重复 id 的添加会被拒绝（要改已有源请先删除再添加）。
+6. 添加后可以点「测试」：应用会真实请求一次列表接口，返回总条数与
+   前几条标题。这一步不通，说明 api 地址填错了或对方站点不可用。

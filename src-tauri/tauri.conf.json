@@ -1,0 +1,76 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TTV Short Drama",
+  "version": "0.0.1",
+  "identifier": "com.ttv.shortdrama",
+  "build": {
+    "beforeDevCommand": "npm run dev -- --host 127.0.0.1 --port 5175 --strictPort",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://127.0.0.1:5175",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "TTV Short Drama",
+        "width": 1440,
+        "height": 920,
+        "minWidth": 1080,
+        "minHeight": 720,
+        "resizable": true,
+        "decorations": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* https: http:; img-src 'self' asset: http://asset.localhost https: http: data: blob:; media-src 'self' asset: http://asset.localhost http://127.0.0.1:* https: http: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; worker-src 'self' blob:",
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$APPDATA/**",
+          "$APPLOCALDATA/**",
+          "$RESOURCE/**",
+          "$LOCALDATA/**"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "publisher": "kiocou",
+    "copyright": "Copyright (c) 2026 kiocou",
+    "category": "Entertainment",
+    "shortDescription": "短剧 / 漫剧 / 动漫桌面播放器",
+    "longDescription": "Windows 专属的短剧 / 漫剧 / 动漫桌面播放器：多源目录、无缝连播、画中画小窗、本地转码与缓存。仅供个人学习与技术研究。",
+    "licenseFile": "../LICENSE",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "resources/python",
+      "resources/shortdrama-worker",
+      "resources/mpv",
+      "resources/guo-core",
+      "resources/ttv-player"
+    ],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "installMode": "currentUser",
+        "languages": [
+          "SimpChinese"
+        ]
+      },
+      "wix": {
+        "language": [
+          "zh-CN"
+        ]
+      }
+    }
+  }
+}

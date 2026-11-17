@@ -1,0 +1,377 @@
+/* Windows 11 Mica & Fluent Visual System */
+
+:root {
+  --mica-bg: #f3f5f8;
+  --mica-canvas: rgba(255, 255, 255, 0.72);
+  --mica-card: rgba(255, 255, 255, 0.86);
+  --mica-card-hover: rgba(255, 255, 255, 0.96);
+  --mica-hud: rgba(255, 255, 255, 0.90);
+  --mica-border: rgba(255, 255, 255, 0.92);
+  --mica-border-subtle: rgba(0, 0, 0, 0.05);
+  --accent-primary: #0067c0;
+  --accent-hover: #005bb5;
+  --accent-light: rgba(0, 103, 192, 0.08);
+
+  /* 全站唯一的底衬。html / body / .mica-backdrop / .ttv-launch 都引用它，
+     不再各抄一份渐变 —— 之前浅色基准色在三处分别是 #f2f4f7 与 #f3f5f8，
+     启动动画撤层时会露出色差。暗色主题只覆盖这一个变量（见 dark.css）。 */
+  --theme-backdrop:
+    radial-gradient(1200px 800px at 12% 6%, rgba(211, 230, 252, 0.85) 0%, transparent 62%),
+    radial-gradient(1000px 720px at 88% 94%, rgba(231, 238, 249, 0.90) 0%, transparent 64%),
+    linear-gradient(180deg, #f5f7fa 0%, #eef2f7 100%);
+}
+
+/* Mica Backdrop Layer */
+.mica-backdrop {
+  background: var(--theme-backdrop);
+}
+
+/* 主内容画板与侧栏的圆角、边距、投影必须一致，否则一个像贴边窗口、
+   一个像浮层。这两处都只在这里定，视图里不再各写一份。 */
+.ttv-workspace-panel {
+  border-radius: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  box-shadow:
+    0 16px 36px -6px rgba(15, 23, 42, 0.08),
+    0 4px 12px -2px rgba(15, 23, 42, 0.03);
+}
+
+/* Mica Acrylic Surfaces */
+.mica-surface {
+  background: var(--mica-card);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--mica-border);
+  box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.03), 0 1px 3px rgba(0, 0, 0, 0.02);
+}
+
+.mica-surface-hover {
+  transition: all 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.mica-surface-hover:hover {
+  background: var(--mica-card-hover);
+  border-color: rgba(255, 255, 255, 1);
+  transform: translateY(-3px);
+  box-shadow: 0 12px 32px -4px rgba(0, 0, 0, 0.06), 0 2px 8px rgba(0, 0, 0, 0.03);
+}
+
+/* Floating HUD Glass */
+.mica-hud {
+  background: var(--mica-hud);
+  backdrop-filter: blur(28px) saturate(200%);
+  -webkit-backdrop-filter: blur(28px) saturate(200%);
+  border: 1px solid rgba(255, 255, 255, 0.95);
+  box-shadow: 
+    0 16px 40px -6px rgba(0, 0, 0, 0.09),
+    0 2px 10px rgba(0, 0, 0, 0.03),
+    inset 0 1px 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+/* Acrylic Drawer */
+.mica-drawer {
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(36px) saturate(190%);
+  -webkit-backdrop-filter: blur(36px) saturate(190%);
+  border-left: 1px solid rgba(255, 255, 255, 0.85);
+  box-shadow: -8px 0 32px -4px rgba(0, 0, 0, 0.08);
+}
+
+/* Fluent Button Press */
+.fluent-press {
+  transition: transform 0.12s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.15s ease;
+}
+
+.fluent-press:active {
+  transform: scale(0.96);
+}
+
+/* Windows 11 Fluent Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.14);
+  border-radius: 9999px;
+  transition: background 0.2s ease;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.28);
+}
+
+/*
+  Shimmer Loading Skeleton：静态底色 + 一道高光从左扫到右。
+  底色刻意留在 .shimmer-loading 上而不是伪元素里，这样调用点的
+  `bg-violet-100/60`、`bg-slate-200/70` 等有色骨架仍能覆盖它。
+  高光条与元素等宽，靠 translateX 扫过，因此必须先 overflow: hidden。
+*/
+.shimmer-loading {
+  position: relative;
+  overflow: hidden;
+  background-color: #e2e8f0;
+  /* 凹槽三件套（上沿投影 / 下沿反光 / 内描边），与 .fluent-inset-* 同一套语汇。
+     用 box-shadow 而不是 border，免得挤动调用点已有的盒模型，也让调用点自带的
+     bg-* 有色骨架仍能覆盖底色。 */
+  box-shadow:
+    inset 0 2px 4px rgba(15, 23, 42, 0.13),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.9),
+    inset 0 0 0 1px rgba(148, 163, 184, 0.28);
+}
+
+.shimmer-loading::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  /* 亮带只占中间 ~30%，扫过去才有"一道光"的方向感，而不是整块泛白 */
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 35%,
+    rgba(255, 255, 255, 0.9) 50%,
+    rgba(255, 255, 255, 0) 65%
+  );
+  /* 只扫三趟就停：封面挂起/重试时这个骨架可能停留 20 秒，无限扫光会让整屏
+     卡片一直在闪，和"正在加载"的语义一起变成了永动机。停下后保留静态底色，
+     视觉上仍明确是占位，但不再抢注意力。 */
+  animation: shimmer 1.4s ease-in-out 3;
+}
+
+@keyframes shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shimmer-loading::after {
+    animation: none;
+  }
+}
+
+/*
+  系列卡片的入场：按网格里的位置错峰 14px 上浮。
+
+  这里曾经同时存在两层动画：卡片自己的 `animate-fluent-card-in`，以及这条
+  `.ttv-grid-in > *`。两者写的是同一个 `animation` 属性，谁赢取决于选择器特异性
+  与 DOM 顺序——实测首页同一屏里，前两张跑 `fluentCardIn`、其余跑 `ttv-grid-rise`，
+  而且有些元素拿到的是旧动画实例，于是出现"有的不动、有的动得不一样"。
+  现在只剩这一层：卡片不再自带入场类，网格容器是唯一入口。
+
+  两条既定规矩（见 tailwind.config.js 的 fluent-card-in 长注释）：
+    - **只动 transform，不碰 opacity**：卡片宿主视图是常驻 DOM + display:none，
+      在隐藏祖先里创建的元素动画会卡在 0% 帧，若 0% 有 opacity:0 就永久空白；
+    - 加 delay 必须配 `backwards`，否则延迟期间元素先按终态出现、再跳回起点滑上来，
+      看起来就是闪一下。
+
+  第 13 项起没有 delay —— 滚动加载追加的卡片应当直接入场。
+*/
+@keyframes ttv-grid-rise {
+  from {
+    transform: translateY(14px) scale(0.97);
+  }
+  to {
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .ttv-grid-in > *:nth-child(n) {
+    animation: ttv-grid-rise 0.35s var(--curve-fluent) backwards;
+  }
+
+  .ttv-grid-in > *:nth-child(2) { animation-delay: 35ms; }
+  .ttv-grid-in > *:nth-child(3) { animation-delay: 70ms; }
+  .ttv-grid-in > *:nth-child(4) { animation-delay: 105ms; }
+  .ttv-grid-in > *:nth-child(5) { animation-delay: 140ms; }
+  .ttv-grid-in > *:nth-child(6) { animation-delay: 175ms; }
+  .ttv-grid-in > *:nth-child(7) { animation-delay: 210ms; }
+  .ttv-grid-in > *:nth-child(8) { animation-delay: 245ms; }
+  .ttv-grid-in > *:nth-child(9) { animation-delay: 280ms; }
+  .ttv-grid-in > *:nth-child(10) { animation-delay: 315ms; }
+  .ttv-grid-in > *:nth-child(11) { animation-delay: 350ms; }
+  .ttv-grid-in > *:nth-child(12) { animation-delay: 385ms; }
+}
+
+/* Windows 11 Fluent Inset Tray / Embedded Button Group */
+.fluent-inset-tray {
+  background-color: rgba(241, 245, 249, 0.92);
+  border: 1px solid rgba(226, 232, 240, 0.8);
+  box-shadow: inset 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+}
+
+.fluent-inset-subtle {
+  background-color: rgba(241, 245, 249, 0.75);
+  border: 1px solid rgba(226, 232, 240, 0.65);
+  box-shadow: inset 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+}
+
+/* Fluent Motion & Interactive Dynamics */
+.fluent-card-elevate {
+  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.28s cubic-bezier(0.16, 1, 0.3, 1),
+              background-color 0.2s ease,
+              border-color 0.2s ease;
+  will-change: transform, box-shadow;
+}
+
+.fluent-card-elevate:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 14px 32px -4px rgba(0, 0, 0, 0.07), 0 2px 8px -1px rgba(0, 0, 0, 0.03);
+}
+
+.fluent-card-elevate:active {
+  transform: translateY(0) scale(0.985);
+  transition-duration: 0.1s;
+}
+
+/* Stagger Entrance Delay Utilities */
+.stagger-1 { animation-delay: 25ms; }
+.stagger-2 { animation-delay: 50ms; }
+.stagger-3 { animation-delay: 75ms; }
+.stagger-4 { animation-delay: 100ms; }
+.stagger-5 { animation-delay: 125ms; }
+.stagger-6 { animation-delay: 150ms; }
+.stagger-7 { animation-delay: 175ms; }
+.stagger-8 { animation-delay: 200ms; }
+
+/* ==========================================================================
+   Windows 11 Fluent Convex / Raised Embossed Effects (立体凸出物理质感)
+   ========================================================================== */
+
+/* 1. 嵌入式托盘内的凸起选中态小药丸 / 按钮 (Convex Tab / Segmented Button) */
+.fluent-convex-tab {
+  background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%) !important;
+  border: 1px solid rgba(203, 213, 225, 0.7) !important;
+  border-top-color: #ffffff !important;
+  box-shadow: 
+    0 2px 5px -1px rgba(0, 0, 0, 0.09),
+    0 1px 2px 0 rgba(0, 0, 0, 0.04),
+    inset 0 1px 0 0 #ffffff !important;
+  transform: translateY(-0.5px);
+}
+
+.fluent-convex-tab:hover {
+  background: linear-gradient(180deg, #ffffff 0%, #f1f5f9 100%) !important;
+  box-shadow: 
+    0 3px 8px -1px rgba(0, 0, 0, 0.12),
+    0 1px 3px 0 rgba(0, 0, 0, 0.05),
+    inset 0 1px 0 0 #ffffff !important;
+  transform: translateY(-1px);
+}
+
+.fluent-convex-tab:active {
+  transform: translateY(0.5px) !important;
+  box-shadow: 
+    0 1px 2px 0 rgba(0, 0, 0, 0.06),
+    inset 0 1px 2px 0 rgba(0, 0, 0, 0.05) !important;
+}
+
+/* 2. 实体凸起主操作按键 (Raised Primary Button) */
+.fluent-raised-primary {
+  background: linear-gradient(180deg, #0078d4 0%, #0067c0 100%) !important;
+  border: 1px solid #005bb5 !important;
+  border-top-color: rgba(255, 255, 255, 0.45) !important;
+  box-shadow: 
+    0 4px 12px -2px rgba(0, 103, 192, 0.42),
+    0 1px 3px 0 rgba(0, 0, 0, 0.1),
+    inset 0 1px 1px 0 rgba(255, 255, 255, 0.5),
+    inset 0 -1px 1px 0 rgba(0, 0, 0, 0.15) !important;
+}
+
+.fluent-raised-primary:hover {
+  background: linear-gradient(180deg, #1084d9 0%, #006ec9 100%) !important;
+  border-top-color: rgba(255, 255, 255, 0.6) !important;
+  box-shadow: 
+    0 6px 16px -2px rgba(0, 103, 192, 0.52),
+    0 2px 4px 0 rgba(0, 0, 0, 0.12),
+    inset 0 1px 1px 0 rgba(255, 255, 255, 0.65) !important;
+  transform: translateY(-1px);
+}
+
+.fluent-raised-primary:active {
+  transform: translateY(1px) !important;
+  box-shadow: 
+    0 1px 4px 0 rgba(0, 103, 192, 0.35),
+    inset 0 2px 4px 0 rgba(0, 0, 0, 0.25) !important;
+}
+
+/* 3. 实体凸起次级按键 / 瓦片 (Raised Secondary / Tile) */
+.fluent-raised-tile {
+  background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+  border: 1px solid rgba(203, 213, 225, 0.75);
+  border-top-color: #ffffff;
+  box-shadow: 
+    0 3px 8px -2px rgba(0, 0, 0, 0.08),
+    0 1px 3px 0 rgba(0, 0, 0, 0.03),
+    inset 0 1px 0 0 #ffffff;
+}
+
+.fluent-raised-tile:hover {
+  transform: translateY(-1.5px);
+  border-color: rgba(147, 197, 253, 0.8);
+  border-top-color: #ffffff;
+  box-shadow: 
+    0 6px 16px -3px rgba(0, 0, 0, 0.1),
+    0 2px 6px -1px rgba(0, 0, 0, 0.04),
+    inset 0 1px 0 0 #ffffff;
+}
+
+.fluent-raised-tile:active {
+  transform: translateY(0.5px);
+  box-shadow: 
+    0 1px 2px 0 rgba(0, 0, 0, 0.05),
+    inset 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+}
+
+/* 4. 圆形凸出播放按钮与浮雕按键 (Convex Play Disc / Knob) */
+.fluent-convex-disc {
+  background: linear-gradient(180deg, #0078d4 0%, #0060b2 100%) !important;
+  border: 1px solid rgba(255, 255, 255, 0.4) !important;
+  border-top-color: rgba(255, 255, 255, 0.8) !important;
+  box-shadow: 
+    0 4px 14px 0 rgba(0, 103, 192, 0.45),
+    0 1px 3px 0 rgba(0, 0, 0, 0.15),
+    inset 0 1.5px 1.5px 0 rgba(255, 255, 255, 0.6),
+    inset 0 -1.5px 2px 0 rgba(0, 0, 0, 0.2) !important;
+}
+
+.fluent-convex-disc:hover {
+  background: linear-gradient(180deg, #1084d9 0%, #0067c0 100%) !important;
+  box-shadow: 
+    0 6px 18px 0 rgba(0, 103, 192, 0.55),
+    0 2px 4px 0 rgba(0, 0, 0, 0.18),
+    inset 0 1.5px 1.5px 0 rgba(255, 255, 255, 0.7) !important;
+  transform: scale(1.06) translateY(-0.5px);
+}
+
+.fluent-convex-disc:active {
+  transform: scale(0.95) translateY(1px) !important;
+  box-shadow: 
+    0 2px 6px 0 rgba(0, 103, 192, 0.3),
+    inset 0 2px 4px 0 rgba(0, 0, 0, 0.3) !important;
+}
+
+/* 5. 悬浮凸出磨砂玻璃浮岛 (Raised Frosted Island) */
+.fluent-raised-island {
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(28px) saturate(200%);
+  -webkit-backdrop-filter: blur(28px) saturate(200%);
+  border: 1px solid rgba(255, 255, 255, 0.95);
+  border-top: 1.5px solid #ffffff;
+  box-shadow:
+    0 12px 36px -4px rgba(0, 0, 0, 0.12),
+    0 2px 8px 0 rgba(0, 0, 0, 0.04),
+    inset 0 1px 1px 0 #ffffff;
+}
+
+
